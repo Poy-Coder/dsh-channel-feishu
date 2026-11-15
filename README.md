@@ -3,6 +3,19 @@
 给 DeepSeek Harness（DSH）装一条**专用飞书通道**：DSH 里的 Agent 可以把消息发到飞书，
 用的是你自己在飞书开放平台新建的自建应用（独立机器人，不和 MyAgents 现有 4 个通道抢事件）。
 
+> **给 Agent：安装前必读 [AGENTS.md](AGENTS.md)。** 装完不等于可用——入站默认关闭，
+> 飞书应用、凭证、权限、发布版本都需要引导用户逐步完成，并按那里的验证清单跑通后再向用户反馈。
+> 人类用户可以直接读下面的"快速开始"。
+
+## 快速开始（人类）
+
+1. 飞书开放平台建**企业自建应用**（不是商店应用），开机器人能力，按"权限"一节开通 scope；
+2. 事件订阅选**长连接**，加 `im.message.receive_v1`，**发布版本**并等审批；
+3. 把 App ID / Secret 写进 `~/.dsh/feishu-channel.json`（或 DSH 凭据库）；
+4. 在 profile 的 `cordis.patch.yml` 打开 `inboundEnabled: true` 并填 `sessionId` / `allowedUsers`；
+5. 飞书里发一条消息，看到流式卡片 + 思考过程即成功；失败先看 `~/.dsh/feishu-inbound.log`。
+
+
 ## 架构（v0.5.0：框架 + provider）
 
 ```
@@ -27,7 +40,7 @@ providers/feishu.js    飞书适配器：token、收发消息、附件上传、�
 接新 IM = 写一个 `providers/<id>.js` 实现上表 + 在 `registry.js` 注册 + 配置 `provider: '<id>'`，
 `index.js` 一行不用改。
 
-## 当前能力（v0.4.0）
+## 当前能力（v0.8.0）
 
 | 能力 | 作用 |
 |---|---|
@@ -36,6 +49,7 @@ providers/feishu.js    飞书适配器：token、收发消息、附件上传、�
 | `feishu_send_file` | 发**附件**：图片走 image 消息，其余走 file 消息（先上传拿 key，再发引用） |
 | `feishu_send_message` | 主动发到**别的**会话时才需要；来源会话的回复已自动回传，不要重复调用 |
 | `feishu_channel_status` | 报告通道是否配置、region / 默认目标，以及 tenant_access_token 能否取到 |
+| 问答卡 | 模型调用 `ask_user_question` 时，把问题发到来源飞书会话：**选项按钮**点选即答，或直接回复序号/选项文字/自由文本；超时按"跳过"结算，不挂死回合 |
 
 设计要点：**通道是传输层，不是提示词约定**。飞书会话 id、发送者、回复目标都存在插件的
 sidecar（`feishu-channel-state.json` 的 `chats`，以及进程内的 chat memory），不进用户消息——
@@ -64,10 +78,10 @@ sidecar（`feishu-channel-state.json` 的 `chats`，以及进程内的 chat memo
 dsh plugin add dsh-channel-feishu
 ```
 
-或用 Release 里的压缩包（`v0.7.2` 起附带）：
+或用 Release 里的压缩包（`v0.8.1` 起附带）：
 
 ```bash
-dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.7.2/dsh-channel-feishu-0.7.2.tgz
+dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.8.1/dsh-channel-feishu-0.8.1.tgz
 ```
 
 依赖必须用扁平结构装（非 ASCII 目录下 pnpm 的软链会把路径写坏）：
@@ -96,6 +110,44 @@ pnpm install --node-linker=hoisted
 ```
 
 入站是显式选择，因为它会让飞书里能发消息的人驱动本机 agent，并把该工作区的会话切到完全权限。
+
+## 飞书应用类型：必须是「企业自建应用」
+
+| 类型 | 能不能用 | 原因 |
+|---|---|---|
+| **企业自建应用**（推荐，唯一顺畅路径） | 可以 | 自己租户内创建，能用**长连接**收事件、能申请全部 scope、发布由自己管理员审批 |
+| 商店应用 / ISV | 不行 | 面向其它租户分发，事件只能走公网 HTTP 回调（需要公网地址 + 验签解密），长连接不可用，多数权限要平台审核 |
+| 个人版 / 免费版租户 | 不完整 | `im:message.p2p_msg`、`contact:user.id:readonly`、`cardkit:card:write` 等 scope 通常需要企业租户 + 管理员审批发布 |
+| 群自定义机器人 webhook | 只能发 | 无法接收消息，做不了双向通道 |
+
+关键动作顺序：**加机器人能力 → 开权限 → 事件订阅选长连接并加 `im.message.receive_v1` → 创建版本并发布 → 等管理员审批**。权限与事件订阅在版本发布前都不生效。
+
+## 稳定性与语义
+
+| 话题 | 行为 |
+|---|---|
+| 历史消息 | **不补投**。长连接只接收建连之后的事件；DSH 关闭期间的消息不会在下次启动时补发（需要追溯就用 API 读会话） |
+| 重复事件 | 入站 `event_id` 去重并**持久化**在 `feishu-channel-state.json`（保留最近 400 条），重连/重启不会重复投递 |
+| 多客户端 | 飞书长连接是集群模式：同一 app 开两条连接，事件只会随机投给其中一个。**同一应用只跑一个 DSH**，要并行就用第二个应用 |
+| 从别的机器人切换过来 | 先停掉旧框架的长连接，否则两边抢事件；换用**另一个 app** 是安全的，会话与 chat 映射按会话 id 存，不依赖 app |
+| 限流 | 写卡 200ms/次（≤5 次/秒），遇 `230020` 退避 2 秒，终局 `close` 重试一次；不要调小间隔 |
+| 并发建卡 | 每轮单飞，`sequence` 严格递增，避免一张卡变多张 |
+| CoT 超长 | 飞书按 **UTF-8 字节**限长（不是字符），推理文本自动分片（每片 400 字符，事件内容上限 3000 字节） |
+| 工作区幂等 | 按 canonical 路径 `resolveByPath` → 复用；缺目录自动创建；更新插件不会重复建工作区 |
+| 默认路径 | 不落在 Windows 系统盘：优先非 C: 盘根目录，`workspacePath` 永远优先 |
+
+## 与其他飞书 / IM 插件的区别
+
+| 维度 | 本插件 | 常见同类做法 |
+|---|---|---|
+| 入站提示词 | **原文直投**，会话记录里没有 chat id、没有"用某工具回复"的前缀 | 常在消息外再包一层说明与输出要求 |
+| 会话落点 | 桌面 profile 的「飞书」工作区：自动创建、先命名再挂载、无人值守权限预设 | 另起 headless 进程或独立会话目录，GUI 列表里看不到 |
+| 思考过程 | **飞书原生 CoT**（推理 + 工具调用带图标） | 多数没有，或只有一个"思考中"占位 |
+| 答案呈现 | CardKit 流式卡片（服务端打字机 + 200ms 增量 + 突发文本切片回放） | 整卡更新、无打字机，或纯文本 |
+| 附件 | 双向：入站图片落盘，出站 `feishu_send_file` 发图/文件 | 多为单向或缺失 |
+| 交互 | 原生 `/help /status /new /rename /stop /model /think`、问答卡（选项按钮） | 视项目而定，常见只有 `/new` |
+| 依赖 | 运行期 2 个（`@deepseek-ai/schemastery`、可选的 `@larksuiteoapi/node-sdk`） | 常见依赖 `lark-cli`、`@larksuite/channel` 等更重的栈 |
+| 配置 | `Config` schema（设置页表单）+ 凭据库，secret 不进 patch | 多为手改配置、secret 明文进配置文件 |
 
 ## 权限（飞书后台）
 
@@ -292,6 +344,38 @@ reactions: true         # 加/移除 THINKING 反应
 7. 每次入站的结论都写一行 JSONL 到 `logFile`：`delivered` / `dropped`（含原因）/ `error` /
    `release` / `switched`。飞书"发消息没反应"时先看这个文件。
 
+### 飞书问答卡（ask_user_question）
+
+`ask_user_question` 在 DSH 里走 Agent 作用域的 `user-questions/request` 瀑布：Web GUI 用一个
+Remote Event 应答，**纯飞书会话没有浏览器页面时没有任何应答方**，工具调用会立刻以
+`NO_PROVIDER` 失败。插件现在组合了第二个应答方（`answerUserQuestion`）：
+
+1. 只认"从飞书会话发起、且在 chat memory 里"的问题（其他会话交给 GUI，`next()` 放行）；
+2. 发一张 schema 2.0 交互卡：每个选项一个 callback 按钮（`value: {c,q,o}`），多选另有「提交」，
+   每个问题另有「跳过」，卡底一条状态行（等待/已选/超时）；
+3. 点按钮 → `card.action.trigger` 经同一条长连接回到插件（`providers/feishu.js` 的 dispatcher
+   已注册），校验 `allowedUsers` 后结算；没有按钮回调时用户直接回复
+   **序号 / 选项文字 / 自由文本 / 「跳过」** 也能答（单问题批次），该消息不再当成普通提问投递；
+4. 超时（`questionTimeoutSeconds`，默认 600 秒，0 为不限）按"跳过"结算并在卡底记一笔；
+   卡片本身发不出去时降级为纯文本问题（文字回复照常可答）。
+
+配置字段：
+
+| 字段 | 默认 | 作用 |
+|---|---|---|
+| `questionCards` | `true` | 关掉后问题只留在 Web GUI，飞书不接管 |
+| `questionTimeoutSeconds` | `600` | 等问题多久；`0` 表示一直等（不推荐，回合会挂着） |
+
+日志新增 `question` 事件：`card-sent` / `text-sent` / `card-failed` / `answered`（含 `via: text`）/
+`timeout` / `skipped` / `aborted` / `card-dropped`，都在 `feishu-inbound.log` 里。
+
+**飞书后台要求**：按钮回调依赖应用订阅「卡片回传交互」事件（`card.action.trigger`，长连接即可）；
+没配也不影响文字回复路径。问题卡只发给**已知来源会话**（chat memory / `sessionId` + `defaultChatId`），
+不会接管其它会话的问答。
+
+已知限制（v0.8.0）：文字回复只解析**单问题**批次，多问题批次需要点按钮；回答后用 cardkit 更新卡底
+状态行，按钮仍留在卡上（重复点击会得到"这个问题已经结束"的 toast）。
+
 ### 什么时候要重启
 
 装入新 bundle 时 HMR 会直接生效；但**替换已加载插件的 JS 代码需要重启一次 Harness**
@@ -308,7 +392,8 @@ reactions: true         # 加/移除 THINKING 反应
 ## 已知边界
 
 - 入站支持**纯文本、富文本（图文 post）与单张图片**：post 抽文字 + 最多下载 4 张图，图片落到
-  `inboundFilesDir` 并在消息里给出本地路径。`file`/`audio`/`media`/`sticker`/交互卡片仍未支持。
+  `inboundFilesDir` 并在消息里给出本地路径。`file`/`audio`/`media`/`sticker` 仍未支持；出站问答卡
+  的按钮回调已支持（见上），但**别人发的**任意交互卡片仍不会被处理。
 - token 按 appId 进程内缓存，提前 60s 过期；不做持久化。
 - 错误以工具错误结果返回（不会中断整轮对话），包含飞书 `code/msg`。
 - 入站要求飞书应用开通 `im.message.receive_v1` 事件（长连接模式）并已发布版本。
@@ -321,5 +406,9 @@ reactions: true         # 加/移除 THINKING 反应
 ## 开发
 
 ```powershell
-node test/smoke.mjs   # 用假 ctx 校验注册、schema 子集与错误路径，不发网络请求
+node test/smoke.mjs             # 用假 ctx 校验注册、schema 子集与错误路径，不发网络请求
+node test/question-cards.mjs    # 问答卡 JSON、按钮值、文字解析、卡片事件归一化（纯函数）
+node test/question-flow.mjs     # 用假 provider 跑通整条问答链路：建卡、点按钮、超时、文字兜底
+node test/question-card-probe.mjs            # 用真实凭据校验卡片 JSON（只建卡不发消息）
+node test/question-card-probe.mjs --send     # 真发一张探针卡到默认群
 ```

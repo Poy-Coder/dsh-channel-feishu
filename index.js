@@ -77,6 +77,8 @@ export const Config = z.object({
   notifyOnNew: z.boolean().default(true).description('Reply on the IM when /new creates a session.'),
   streamingCards: z.boolean().default(true).description('Stream answers into a card; off sends plain text.'),
   autoReply: z.boolean().default(true).description('Deliver each turn\u2019s answer back to the originating chat.'),
+  questionCards: z.boolean().default(true).description('Answer ask_user_question in Feishu with an interactive card (buttons plus a text-reply fallback).'),
+  questionTimeoutSeconds: z.number().default(600).description('Seconds a question card waits for an answer before it is skipped; 0 waits forever.'),
   thinking: z.boolean().default(true).description('Show the native thinking process (reasoning and tool calls) during a turn.'),
   thinkingHidden: z.boolean().default(false).description('Hide the thinking process once the turn finishes.'),
   reactions: z.boolean().default(true).description('Acknowledge an inbound message with a reaction while the turn runs.'),
@@ -723,19 +725,44 @@ export function observeAssistantStream(ctx, config, payload, sessionId, turnHint
 // activity, never the answer — that stays in the streaming card.
 // ---------------------------------------------------------------------------
 
-const COT_EVENT_MAX_CHARS = 4096
+// Feishu measures the event payload in bytes, not UTF-16 units: a 4096-char
+// Chinese delta is ~12 KB and the API rejects the whole batch. Stay well under.
+const COT_EVENT_MAX_BYTES = 3000
 const COT_BATCH = 50
+const COT_REASONING_PIECE_CHARS = 400
 const cotRuns = new Map()
 const ackReactions = new Map()
 let cotStamp = 0
 
-/** Encode one AG-UI event with a strictly increasing timestamp and a bounded payload. */
+const byteLengthOf = (text) => Buffer.byteLength(String(text ?? ''), 'utf8')
+
+/** Shrink the largest string field until the encoded event fits the byte budget. */
+function clampCotContent(content) {
+  const source = content && typeof content === 'object' ? content : {}
+  let encoded = JSON.stringify(source)
+  if (byteLengthOf(encoded) <= COT_EVENT_MAX_BYTES) return encoded
+  const clone = { ...source }
+  for (const key of ['delta', 'code', 'content', 'message', 'arguments', 'title']) {
+    if (typeof clone[key] !== 'string') continue
+    let value = clone[key]
+    let guard = 0
+    while (value && byteLengthOf(JSON.stringify({ ...clone, [key]: value })) > COT_EVENT_MAX_BYTES && guard < 24) {
+      value = value.slice(0, Math.floor(value.length * 0.7))
+      guard += 1
+    }
+    if (value.length < clone[key].length) clone.truncated = true
+    clone[key] = value
+  }
+  encoded = JSON.stringify(clone)
+  return byteLengthOf(encoded) <= COT_EVENT_MAX_BYTES ? encoded : JSON.stringify({ truncated: true })
+}
+
+/** Encode one AG-UI event with a strictly increasing timestamp and a byte-bounded payload. */
 export function cotEvent(type, content) {
   cotStamp = Math.max(Date.now(), cotStamp + 1)
-  const encoded = JSON.stringify(content ?? {})
   return {
     event_type: type,
-    content: encoded.length <= COT_EVENT_MAX_CHARS ? encoded : JSON.stringify({ truncated: true }),
+    content: clampCotContent(content),
     timestamp: String(cotStamp),
   }
 }
@@ -819,7 +846,14 @@ function appendCotReasoning(run, text) {
     run.reasoningOpen = true
     cotEnqueue(run, cotEvent('REASONING_MESSAGE_START', { messageId, role: 'reasoning' }))
   }
-  cotEnqueue(run, cotEvent('REASONING_MESSAGE_CONTENT', { messageId, delta: text }))
+  // One event per bounded slice: a single whole-block reasoning delta can be far
+  // past the API's byte budget, and the platform rejects the entire batch.
+  let rest = String(text)
+  while (rest) {
+    const piece = rest.slice(0, COT_REASONING_PIECE_CHARS)
+    rest = rest.slice(piece.length)
+    cotEnqueue(run, cotEvent('REASONING_MESSAGE_CONTENT', { messageId, delta: piece }))
+  }
 }
 
 const sendMessageTool = (config) => ({
@@ -1452,6 +1486,22 @@ function readChannelState(config) {
   }
 }
 
+/** Event ids already handled, persisted so a restart cannot re-deliver them. */
+const SEEN_EVENTS_LIMIT = 400
+
+function loadSeenEvents(config) {
+  try {
+    const stored = readChannelState(config).seenEvents
+    return Array.isArray(stored) ? stored.filter((id) => typeof id === 'string' && id) : []
+  } catch {
+    return []
+  }
+}
+
+function persistSeenEvents(config, seen) {
+  return writeChannelState(config, { seenEvents: [...seen].slice(-SEEN_EVENTS_LIMIT) })
+}
+
 function writeChannelState(config, patch) {
   try {
     const next = { ...readChannelState(config), ...patch, updatedAt: Date.now() }
@@ -1559,7 +1609,120 @@ const HELP_TEXT = [
   '/new [内容] — 开一段新会话（带内容则作为第一条消息）',
   '/rename <标题> — 给当前会话改名',
   '/stop — 中断进行中的回合',
+  '/model — 看当前模型与可用模型；/model provider/model 切换',
+  '/think — 看思考强度档位；/think low|medium|high 或 /think default',
 ].join('\n')
+
+/**
+ * Model routes and thinking effort. DSH exposes `agent.model.select()` and the
+ * `llm` catalog; both are optional services, so every path degrades to a message
+ * instead of throwing.
+ */
+async function liveAgentOf(ctx, config) {
+  const sessionId = currentSessionId(config)
+  const agent = sessionId ? ctx.agents?.get?.(sessionId) : undefined
+  return { sessionId, agent }
+}
+
+async function modelCatalog(ctx, providerFilter) {
+  const llm = typeof ctx.get === 'function' ? ctx.get('llm') : undefined
+  if (!llm?.listProviders) return undefined
+  const providers = await llm.listProviders()
+  const wanted = providerFilter ? providers.filter((entry) => entry.id === providerFilter) : providers
+  const rows = []
+  for (const provider of wanted) {
+    let models = []
+    try {
+      models = await llm.listModels(provider.id)
+    } catch {
+      models = []
+    }
+    for (const model of models) rows.push({ provider: provider.id, id: model.id, name: model.name ?? model.id })
+  }
+  return rows
+}
+
+const effortLabel = (selection) => (selection?.reasoningEffort ? ` · 思考 ${selection.reasoningEffort}` : '')
+
+/** `/model` — list or switch. Returns the reply text. */
+export async function modelCommand(ctx, config, args) {
+  const { agent } = await liveAgentOf(ctx, config)
+  if (!agent?.model) return '当前会话未激活。先发一条消息，或 /new 建一段会话。'
+  const current = agent.model.current?.()
+  const wanted = String(args ?? '').trim()
+  if (!wanted) {
+    const rows = await modelCatalog(ctx)
+    const head = current
+      ? `当前：${current.provider}/${current.model}${effortLabel(current)}`
+      : '当前：未记录'
+    if (!rows) return `${head}\n宿主未暴露模型目录，可用 /model provider/model 直接指定。`
+    const lines = rows.slice(0, 30).map((row) => `${row.provider}/${row.id}`)
+    return [head, `可用（${rows.length}）：`, ...lines, rows.length > 30 ? `…共 ${rows.length} 个，用 /model provider/model 直接切` : '']
+      .filter(Boolean).join('\n')
+  }
+  let provider
+  let model
+  if (wanted.includes('/')) {
+    [provider, model] = wanted.split('/', 2)
+  } else {
+    const rows = (await modelCatalog(ctx)) ?? []
+    const matches = rows.filter((row) => row.id === wanted)
+    if (matches.length === 0) return `找不到模型 ${wanted}。先发 /model 看列表。`
+    if (matches.length > 1) {
+      return `模型 ${wanted} 出现在多个 provider 下，请用 provider/model 指定：`
+        + matches.map((row) => `${row.provider}/${row.id}`).join(', ')
+    }
+    provider = matches[0].provider
+    model = matches[0].id
+  }
+  const llm = ctx.get?.('llm')
+  if (!llm?.resolveModelInfo) return '宿主未暴露模型目录，无法校验这个路由。'
+  let info
+  try {
+    info = await llm.resolveModelInfo(provider, model)
+  } catch (error) {
+    return `切换失败：${errorText(error)}`
+  }
+  const efforts = info?.reasoning?.efforts ?? []
+  const keep = current?.reasoningEffort && efforts.some((entry) => entry.id === current.reasoningEffort)
+    ? current.reasoningEffort
+    : info?.reasoning?.defaultEffort
+  agent.model.select({ provider, model, ...(keep ? { reasoningEffort: keep } : {}) })
+  return `已切到 ${provider}/${model}${keep ? ` · 思考 ${keep}` : ''}`
+}
+
+/** `/think` — show or set the reasoning effort of the current model. */
+export async function thinkCommand(ctx, config, args) {
+  const { agent } = await liveAgentOf(ctx, config)
+  if (!agent?.model) return '当前会话未激活。先发一条消息，或 /new 建一段会话。'
+  const current = agent.model.current?.()
+  if (!current) return '还没有模型选择，先用 /model 选一个。'
+  const llm = ctx.get?.('llm')
+  let info
+  try {
+    info = await llm?.resolveModelInfo?.(current.provider, current.model)
+  } catch (error) {
+    return `读取模型信息失败：${errorText(error)}`
+  }
+  const efforts = info?.reasoning?.efforts ?? []
+  const describe = () => [
+    `当前：${current.provider}/${current.model}`,
+    `思考：${current.reasoningEffort ?? '(默认)'}`
+      + (info?.reasoning?.defaultEffort ? ` · 模型默认 ${info.reasoning.defaultEffort}` : ''),
+    efforts.length ? `可选：${efforts.map((entry) => entry.id).join(' / ')}` : '这个模型不支持思考强度。',
+  ].join('\n')
+  const wanted = String(args ?? '').trim().toLowerCase()
+  if (!wanted) return describe()
+  if (!efforts.length) return `${current.provider}/${current.model} 不支持思考强度。`
+  if (wanted === 'default' || wanted === 'auto') {
+    agent.model.select({ provider: current.provider, model: current.model })
+    return `已恢复默认思考强度。\n${describe()}`
+  }
+  const match = efforts.find((entry) => String(entry.id).toLowerCase() === wanted)
+  if (!match) return `没有这个档位：${wanted}\n${describe()}`
+  agent.model.select({ provider: current.provider, model: current.model, reasoningEffort: match.id })
+  return `思考强度已设为 ${match.id}。\n${describe()}`
+}
 
 /** Parse `/name args`; null when the text is not a command. */
 export function parseSlashCommand(text) {
@@ -1606,6 +1769,7 @@ export async function statusText(ctx, config, chatId) {
     `权限：${preset}`,
     `入站：${inbound.ready ? '已就绪' : `未就绪${inbound.error ? `（${inbound.error}）` : ''}`}`,
     `目标群：${chatId || settings.defaultChatId || '(无)'}`,
+    `问答：${config.questionCards === false ? '关闭' : '开启'}${pendingQuestions.size > 0 ? `（等待回答 ${pendingQuestions.size}）` : ''}`,
     `提供方：${provider().id}`,
   ].join('\n')
 }
@@ -1685,6 +1849,18 @@ export async function handleSlashCommand(ctx, config, { name, args, chatId, send
       return true
     }
 
+    case 'model': {
+      await reply(await modelCommand(ctx, config, args))
+      log('model', { args: args || '(list)' })
+      return true
+    }
+
+    case 'think': {
+      await reply(await thinkCommand(ctx, config, args))
+      log('think', { args: args || '(show)' })
+      return true
+    }
+
     default:
       await reply(`未识别的命令 /${name}。\n\n${HELP_TEXT}`)
       log('unknown')
@@ -1702,6 +1878,7 @@ export async function handleInboundEvent(ctx, config, data, seen) {
     if (seen.has(eventId)) return
     seen.add(eventId)
     if (seen.size > INBOUND_DEDUPE_LIMIT) seen.delete(seen.values().next().value)
+    persistSeenEvents(config, seen)
   }
 
   if (inbound.senderType === 'app') return
@@ -1761,6 +1938,10 @@ export async function handleInboundEvent(ctx, config, data, seen) {
     await handleSlashCommand(ctx, config, { ...command, chatId, senderId })
     return
   }
+
+  // A pending question owns the next reply in its chat: a numbered, labelled or
+  // free-text answer settles the tool call instead of starting a new turn.
+  if (consumeQuestionTextAnswer(ctx, config, { chatId, senderId, text })) return
 
   const sessionId = currentSessionId(config)
   if (!sessionId) {
@@ -1827,6 +2008,477 @@ export async function handleInboundEvent(ctx, config, data, seen) {
   log({ event: 'inbound', result: 'delivered', senderId, chatId, sessionId, via: resolved.via })
 }
 
+// ---------------------------------------------------------------------------
+// Question cards
+//
+// `ask_user_question` is answered on the Agent-scoped `user-questions/request`
+// waterfall. The Web GUI answers it through a Remote Event that only an
+// attached browser page receives, so a Feishu-only session would otherwise fail
+// the tool call with NO_PROVIDER. This answerer is composed next to the GUI's:
+// it sends the question to the chat that owns the session, waits for a button
+// click (or a text reply), and returns the batch to the waiting tool call.
+// ---------------------------------------------------------------------------
+
+/** Card element that carries the waiting/answered note under the buttons. */
+export const QA_STATUS_ELEMENT_ID = 'qa_note'
+
+/** One answerable request per session; the value is the pending record below. */
+const pendingQuestions = new Map()
+const questionStats = { asked: 0, answered: 0, skipped: 0, failed: 0 }
+
+export function pendingQuestionCount() {
+  return pendingQuestions.size
+}
+
+export function questionCardStats() {
+  return { ...questionStats, waiting: pendingQuestions.size }
+}
+
+const questionKeyOf = (sessionId, callId) => `${sessionId}|${callId}`
+
+function allowedUsersOf(config) {
+  return Array.isArray(config.allowedUsers)
+    ? config.allowedUsers.map((value) => String(value)).filter(Boolean)
+    : []
+}
+
+/** Drop the recommendation suffix so a reply can name the label. */
+function plainLabel(label) {
+  return String(label ?? '').replace(/\s*[（(](?:推荐|[Rr]ecommended)[)）]\s*$/u, '').trim()
+}
+
+function sameLabel(left, right) {
+  return plainLabel(left).toLowerCase() === plainLabel(right).toLowerCase()
+}
+
+/** Defensive copy of the tool's question array (the host owns the original). */
+function normalizeQuestions(questions) {
+  return (Array.isArray(questions) ? questions : [])
+    .filter((question) => question && typeof question === 'object')
+    .map((question, index) => ({
+      id: String(question.id ?? `q${index}`),
+      question: String(question.question ?? ''),
+      header: question.header === undefined ? '' : String(question.header),
+      detail: question.detail === undefined ? '' : String(question.detail),
+      options: (Array.isArray(question.options) ? question.options : [])
+        .filter((option) => option && typeof option === 'object' && typeof option.label === 'string')
+        .map((option) => ({
+          label: String(option.label),
+          description: option.description === undefined ? '' : String(option.description),
+        })),
+      multiSelect: question.multiSelect === true,
+      intent: question.intent,
+    }))
+}
+
+/**
+ * Build the interactive question card (schema 2.0).
+ *
+ * Every option becomes a callback button whose value carries the call id and
+ * the (question, option) indexes, so a click needs no server-side lookup by
+ * button text. A multi-select question also gets an explicit 提交 button; a
+ * free-text question relies on the reply fallback.
+ */
+export function questionCardJson({ callId, questions, selections, skipped, note, answered }) {
+  const elements = []
+  questions.forEach((question, index) => {
+    const options = Array.isArray(question?.options) ? question.options : []
+    const lines = []
+    if (question?.header) lines.push(`**${question.header}**`)
+    if (question?.question) lines.push(question.question)
+    if (question?.detail) {
+      lines.push(`> ${String(question.detail).split('\n').join('\n> ')}`)
+    }
+    if (options.length > 0) {
+      options.forEach((option, optionIndex) => {
+        const chosen = selections?.[index]?.has?.(optionIndex) === true
+        const label = String(option?.label ?? '')
+        const suffix = option?.description ? ` — ${option.description}` : ''
+        lines.push(`${optionIndex + 1}. ${label}${chosen ? ' ✅' : ''}${suffix}`)
+      })
+      const hint = question?.multiSelect === true
+        ? '可多选：点选项切换选中，选好后点「提交」。'
+        : '点下面的按钮，或直接回复序号 / 选项文字。'
+      lines.push(`<font color="grey">${hint}</font>`)
+    } else {
+      lines.push('<font color="grey">直接回复文字作为答案；回复「跳过」表示不作答。</font>')
+    }
+    elements.push({ tag: 'markdown', content: lines.join('\n') })
+    if (options.length === 0) return
+    const columns = options.map((option, optionIndex) => ({
+      tag: 'column',
+      width: 'auto',
+      elements: [{
+        tag: 'button',
+        text: { tag: 'plain_text', content: plainLabel(option?.label).slice(0, 30) || `选项${optionIndex + 1}` },
+        type: optionIndex === 0 ? 'primary' : 'default',
+        behaviors: [{ type: 'callback', value: { c: callId, q: index, o: optionIndex } }],
+      }],
+    }))
+    if (question?.multiSelect === true) {
+      columns.push({
+        tag: 'column',
+        width: 'auto',
+        elements: [{
+          tag: 'button',
+          text: { tag: 'plain_text', content: '提交' },
+          type: 'primary',
+          behaviors: [{ type: 'callback', value: { c: callId, q: index, submit: true } }],
+        }],
+      })
+    }
+    if (answered !== true) {
+      columns.push({
+        tag: 'column',
+        width: 'auto',
+        elements: [{
+          tag: 'button',
+          text: { tag: 'plain_text', content: '跳过' },
+          type: 'default',
+          behaviors: [{ type: 'callback', value: { c: callId, q: index, skip: true } }],
+        }],
+      })
+    }
+    elements.push({ tag: 'column_set', flex_mode: 'none', columns })
+  })
+  const noteText = note || '等待你的回答…'
+  if (note !== null && noteText !== '') {
+    elements.push({
+      tag: 'markdown',
+      element_id: QA_STATUS_ELEMENT_ID,
+      content: `<font color="grey">${noteText}</font>`,
+      text_size: 'notation',
+    })
+  }
+  const count = questions.length
+  return {
+    schema: '2.0',
+    config: { update_multi: true, width_mode: 'fill', summary: { content: count > 1 ? `有 ${count} 个问题` : '需要你的回答' } },
+    header: {
+      title: { tag: 'plain_text', content: count > 1 ? `有 ${count} 个问题` : '需要你的回答' },
+      template: answered === true ? 'green' : 'blue',
+    },
+    body: { elements },
+  }
+}
+
+/** Plain-text fallback used when the card cannot be sent at all. */
+function questionText(questions) {
+  const lines = ['需要你的回答：']
+  questions.forEach((question, index) => {
+    if (questions.length > 1) lines.push('', `${index + 1}. ${question.header || question.question}`)
+    else lines.push('', question.header ? `${question.header}` : '', question.question)
+    if (question.detail) lines.push(question.detail)
+    question.options.forEach((option, optionIndex) => {
+      lines.push(`${optionIndex + 1}. ${option.label}${option.description ? ` — ${option.description}` : ''}`)
+    })
+    if (question.options.length === 0) lines.push('直接回复文字作为答案。')
+  })
+  return lines.join('\n')
+}
+
+/**
+ * Parse one text reply as an answer for a single-question batch.
+ *
+ * Returns null when the text is not an answer for this question (an unrelated
+ * message must be delivered normally, not swallowed). Only a single-question
+ * batch is supported through text; multi-question batches need the buttons.
+ */
+export function parseQuestionText(text, questions) {
+  if (!Array.isArray(questions) || questions.length !== 1) return null
+  const question = questions[0]
+  const raw = String(text ?? '').trim()
+  if (!raw) return null
+  const id = String(question.id ?? 'q0')
+  if (/^(跳过|skip)$/iu.test(raw)) return [{ id, selected: [] }]
+  const options = Array.isArray(question.options) ? question.options : []
+  if (options.length === 0) return [{ id, selected: [], custom: raw }]
+  const index = Number(raw)
+  if (Number.isInteger(index) && index >= 1 && index <= options.length) {
+    return [{ id, selected: [options[index - 1].label] }]
+  }
+  const match = options.findIndex((option) => sameLabel(option.label, raw))
+  if (match >= 0) return [{ id, selected: [options[match].label] }]
+  return null
+}
+
+/**
+ * Apply one button value to a pending question.
+ * @returns false when the value does not address this batch.
+ */
+export function applyQuestionSelection(pending, value) {
+  if (!pending || !value || String(value.c ?? '') !== pending.callId) return false
+  const index = Number(value.q)
+  if (!Number.isInteger(index) || index < 0 || index >= pending.questions.length) return false
+  const question = pending.questions[index]
+  const options = question.options
+  if (value.skip === true) {
+    pending.skipped.add(index)
+    pending.submitted.add(index)
+    return true
+  }
+  if (value.submit === true) {
+    pending.submitted.add(index)
+    return true
+  }
+  const optionIndex = Number(value.o)
+  if (!Number.isInteger(optionIndex) || optionIndex < 0 || optionIndex >= options.length) return false
+  if (question.multiSelect) {
+    if (pending.selections[index].has(optionIndex)) pending.selections[index].delete(optionIndex)
+    else pending.selections[index].add(optionIndex)
+    return true
+  }
+  pending.selections[index] = new Set([optionIndex])
+  pending.submitted.add(index)
+  return true
+}
+
+export function isQuestionComplete(pending) {
+  if (!pending || pending.questions.length === 0) return false
+  return pending.questions.every((question, index) => {
+    if (pending.skipped.has(index)) return true
+    if (question.options.length === 0) return false
+    if (question.multiSelect) return pending.submitted.has(index) && pending.selections[index].size > 0
+    return pending.selections[index].size > 0 && pending.submitted.has(index)
+  })
+}
+
+/** The batch the host accepts: one item per question, in order. */
+export function questionAnswersOf(pending) {
+  return pending.questions.map((question, index) => {
+    const chosen = pending.selections[index] instanceof Set ? [...pending.selections[index]] : []
+    const selected = chosen
+      .filter((optionIndex) => optionIndex >= 0 && optionIndex < question.options.length)
+      .map((optionIndex) => question.options[optionIndex].label)
+    return { id: question.id, selected }
+  })
+}
+
+/** The chat that owns one session, or '' when the channel never saw it. */
+function questionChatOf(config, sessionId) {
+  const bound = CHAT_MEMORY.get(sessionId)
+  if (bound) return bound
+  const pinned = String(config.sessionId ?? '').trim()
+  if (pinned && pinned === sessionId) {
+    try { return String(provider().settings().defaultChatId ?? '') } catch { return '' }
+  }
+  return ''
+}
+
+async function refreshQuestionCard(config, pending, status, answers) {
+  if (!pending.cardId) return
+  const summary = status === 'answered'
+    ? `已选择：${(answers ?? []).map((item) => item.selected.join('、') || (item.custom ? `“${item.custom}”` : '跳过')).join('；')}`
+    : status === 'timeout'
+      ? '等待超时，已跳过。'
+      : status === 'skipped'
+        ? '已跳过。'
+        : status === 'aborted'
+          ? '已取消。'
+          : '等待你的回答…'
+  if (!summary) return
+  try {
+    pending.sequence += 1
+    await provider().card.update({
+      cardId: pending.cardId,
+      content: `<font color="grey">${summary}</font>`,
+      sequence: pending.sequence,
+      elementId: QA_STATUS_ELEMENT_ID,
+    })
+  } catch (error) {
+    logInbound(config, {
+      event: 'question', result: 'card-update-failed',
+      sessionId: pending.sessionId, callId: pending.callId, reason: errorText(error),
+    })
+  }
+}
+
+/**
+ * Settle one pending question exactly once.
+ * @param status - answered | skipped | timeout | aborted
+ * @param explicitAnswers - batch computed outside the selection state (text reply)
+ */
+function finishQuestion(config, pending, status, explicitAnswers) {
+  if (!pending || pending.done) return false
+  pending.done = true
+  if (pending.timer) {
+    clearTimeout(pending.timer)
+    pending.timer = undefined
+  }
+  try {
+    if (pending.abortHandler) pending.signal?.removeEventListener?.('abort', pending.abortHandler)
+  } catch { /* ignore */ }
+  pendingQuestions.delete(questionKeyOf(pending.sessionId, pending.callId))
+  const answers = explicitAnswers ?? questionAnswersOf(pending)
+  if (status === 'answered') questionStats.answered += 1
+  else if (status === 'skipped' || status === 'timeout') questionStats.skipped += 1
+  logInbound(config, {
+    event: 'question', result: status,
+    sessionId: pending.sessionId, callId: pending.callId, chatId: pending.chatId,
+    messageId: pending.messageId, count: pending.questions.length,
+    ...(status === 'answered' ? { answers: answers.map((item) => ({ id: item.id, selected: item.selected, ...(item.custom ? { custom: item.custom } : {}) })) } : {}),
+  })
+  if (status === 'aborted') {
+    try { pending.reject(new Error('ask_user_question was aborted before the user answered')) } catch { /* ignore */ }
+  } else {
+    try { pending.resolve(answers) } catch { /* ignore */ }
+  }
+  void refreshQuestionCard(config, pending, status, answers)
+  return true
+}
+
+/** Send the question as a card; fall back to plain text if card creation fails. */
+async function sendQuestionCard(ctx, config, pending) {
+  try {
+    const card = questionCardJson({ callId: pending.callId, questions: pending.questions, note: '等待你的回答…' })
+    const cardId = await provider().card.createRaw({ card })
+    const messageId = await provider().card.attach({ chatId: pending.chatId, cardId })
+    pending.cardId = cardId
+    pending.messageId = messageId
+    logInbound(config, {
+      event: 'question', result: 'card-sent', sessionId: pending.sessionId,
+      callId: pending.callId, chatId: pending.chatId, cardId, messageId,
+    })
+    return true
+  } catch (error) {
+    questionStats.failed += 1
+    warnTo(ctx, `question card failed, falling back to text: ${errorText(error)}`)
+    logInbound(config, {
+      event: 'question', result: 'card-failed', sessionId: pending.sessionId,
+      callId: pending.callId, reason: errorText(error),
+    })
+  }
+  try {
+    await provider().sendText({ chatId: pending.chatId, text: questionText(pending.questions) })
+    logInbound(config, {
+      event: 'question', result: 'text-sent', sessionId: pending.sessionId,
+      callId: pending.callId, chatId: pending.chatId,
+    })
+    return true
+  } catch (error) {
+    logInbound(config, {
+      event: 'question', result: 'send-failed', sessionId: pending.sessionId,
+      callId: pending.callId, reason: errorText(error),
+    })
+    return false
+  }
+}
+
+/**
+ * Compose the channel as a `user-questions/request` answerer.
+ *
+ * Claims only questions owned by a session the channel has seen come from a
+ * Feishu chat; anything else returns `next()` so the Web GUI keeps working.
+ */
+export async function answerUserQuestion(ctx, config, request, next) {
+  if (config.questionCards === false) return await next()
+  const sessionId = String(request?.agent?.id ?? '')
+  const chatId = sessionId ? questionChatOf(config, sessionId) : ''
+  if (!sessionId || !chatId) return await next()
+  const questions = normalizeQuestions(request?.questions)
+  if (questions.length === 0) return await next()
+  const callId = String(request?.wait?.callId ?? `qa-${randomUUID()}`)
+  const key = questionKeyOf(sessionId, callId)
+  if (pendingQuestions.has(key)) return await next()
+
+  const timeoutSeconds = Number(config.questionTimeoutSeconds ?? 600)
+  const timeoutMs = Number.isFinite(timeoutSeconds) && timeoutSeconds >= 0 ? timeoutSeconds * 1000 : 600_000
+  const pending = {
+    sessionId, callId, chatId, questions,
+    selections: questions.map(() => new Set()),
+    skipped: new Set(),
+    submitted: new Set(),
+    messageId: '', cardId: '', sequence: 1,
+    done: false, status: '', signal: request?.signal,
+    resolve: undefined, reject: undefined, timer: undefined, abortHandler: undefined,
+    askedAt: Date.now(),
+  }
+  const answersPromise = new Promise((resolve, reject) => {
+    pending.resolve = resolve
+    pending.reject = reject
+  })
+  pendingQuestions.set(key, pending)
+  const sent = await sendQuestionCard(ctx, config, pending)
+  if (!sent) {
+    pending.done = true
+    pendingQuestions.delete(key)
+    return await next()
+  }
+  questionStats.asked += 1
+  if (timeoutMs > 0) {
+    pending.timer = setTimeout(() => finishQuestion(config, pending, 'timeout'), timeoutMs)
+    pending.timer.unref?.()
+  }
+  if (pending.signal) {
+    pending.abortHandler = () => finishQuestion(config, pending, 'aborted')
+    try { pending.signal.addEventListener('abort', pending.abortHandler, { once: true }) } catch { /* ignore */ }
+  }
+  try {
+    return { answers: await answersPromise }
+  } finally {
+    if (pending.timer) {
+      clearTimeout(pending.timer)
+      pending.timer = undefined
+    }
+    try {
+      if (pending.abortHandler) pending.signal?.removeEventListener?.('abort', pending.abortHandler)
+    } catch { /* ignore */ }
+  }
+}
+
+/**
+ * Handle one card button click.
+ * @returns a toast for the Feishu client, or undefined to ignore the event.
+ */
+export async function handleQuestionCardAction(ctx, config, raw) {
+  const action = provider().normalizeCardAction(raw)
+  if (!action) return undefined
+  const allowed = allowedUsersOf(config)
+  if (allowed.length > 0 && action.operatorId && !allowed.includes(action.operatorId)) {
+    logInbound(config, {
+      event: 'question', result: 'card-dropped', reason: 'operator not in allowedUsers',
+      operatorId: action.operatorId, chatId: action.chatId,
+    })
+    return { toast: { type: 'error', content: '你没有回答这个问题的权限。' } }
+  }
+  const pending = [...pendingQuestions.values()].find((item) => item.messageId && item.messageId === action.messageId)
+    ?? [...pendingQuestions.values()].find((item) => item.chatId === action.chatId && String(action.value?.c ?? '') === item.callId)
+  if (!pending) return { toast: { type: 'info', content: '这个问题已经结束。' } }
+  if (pending.chatId && action.chatId && action.chatId !== pending.chatId) return undefined
+  if (!applyQuestionSelection(pending, action.value)) {
+    logInbound(config, {
+      event: 'question', result: 'card-bad-value', sessionId: pending.sessionId,
+      callId: pending.callId, value: action.value,
+    })
+    return { toast: { type: 'error', content: '无法识别的选择。' } }
+  }
+  if (isQuestionComplete(pending)) {
+    finishQuestion(config, pending, 'answered')
+    return { toast: { type: 'success', content: '已提交。' } }
+  }
+  void refreshQuestionCard(config, pending, 'waiting')
+  return { toast: { type: 'success', content: '已记录选择。' } }
+}
+
+/**
+ * Consume a text reply as the answer to one pending question in that chat.
+ * @returns true when the message was the answer and must not start a turn.
+ */
+export function consumeQuestionTextAnswer(ctx, config, { chatId, senderId, text }) {
+  if (config.questionCards === false) return false
+  const pending = [...pendingQuestions.values()].find((item) => item.chatId === chatId && !item.done)
+  if (!pending) return false
+  const answers = parseQuestionText(text, pending.questions)
+  if (!answers) return false
+  lastInboundAt = Date.now()
+  finishQuestion(config, pending, 'answered', answers)
+  logInbound(config, {
+    event: 'question', result: 'answered', via: 'text', sessionId: pending.sessionId,
+    callId: pending.callId, senderId, chatId,
+  })
+  return true
+}
+
 function startInbound(ctx, config) {
   ctx.inject(['agents'], (scoped) => {
     scoped.effect(() => {
@@ -1836,6 +2488,9 @@ function startInbound(ctx, config) {
       // Outbound half: the answer to every inbound message travels back through
       // the durable-log feed, so no prompt instruction is needed.
       loadChatMemory(config)
+      // Dedupe survives restarts: a reconnecting long connection can redeliver
+      // an event the previous process already handled.
+      for (const eventId of loadSeenEvents(config)) seen.add(eventId)
       channelRuntime = { ctx: scoped, config }
       // The active session may already be live from an earlier message; its
       // policy must match the channel's preset even before the next inbound one,
@@ -1850,6 +2505,14 @@ function startInbound(ctx, config) {
         if (event?.type === 'turn/start') watchAgentStreams(scoped.agents?.get?.(session?.id), channelRuntime)
         observeSessionEvent(scoped, config, session, event)
       })
+
+      // Answer ask_user_question in Feishu: without this, a Feishu-only session
+      // fails the tool call with NO_PROVIDER (no browser page to answer it).
+      // Prepend so the chat wins over the GUI relay when the session is open in
+      // both places; a session the channel does not own still falls through.
+      const offQuestion = typeof scoped.on === 'function'
+        ? scoped.on('user-questions/request', (request, next) => answerUserQuestion(scoped, config, request, next), { prepend: true })
+        : undefined
 
       // Periodically hand back an idle plugin-owned agent; the app re-resumes
       // the session on demand, so a quiet channel costs nothing.
@@ -1868,6 +2531,7 @@ function startInbound(ctx, config) {
               warnTo(scoped, `inbound handler failed: ${error instanceof Error ? error.message : String(error)}`)
             }
           },
+          onCardAction: async (data) => await handleQuestionCardAction(scoped, config, data),
           onState: ({ ready, error }) => {
             setInboundState(config, { ready: Boolean(ready), transport: 'websocket', error: String(error ?? '') })
             if (ready) warnTo(scoped, 'inbound long connection ready')
@@ -1885,6 +2549,7 @@ function startInbound(ctx, config) {
         disposed = true
         clearInterval(releaseTimer)
         try { offSessionEvent?.() } catch { /* ignore */ }
+        try { offQuestion?.() } catch { /* ignore */ }
         try { connectionCleanup() } catch { /* ignore */ }
         disposeAgentStreams()
         channelRuntime = undefined

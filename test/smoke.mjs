@@ -812,6 +812,40 @@ assert.deepEqual(attachedSessions, ['session-ws', 'session-ws2'])
 // A host without the registry must not break delivery.
 assert.equal(await attachToFeishuWorkspace({ logger: { warn: () => {} }, get: () => undefined }, { logFile }, 'x'), false)
 
+// 19. Model and thinking-effort control through the DSH services.
+const { modelCommand, thinkCommand } = await import('../index.js')
+const selections = []
+const fakeModel = {
+  current: () => ({ provider: 'p1', model: 'm1', reasoningEffort: 'low' }),
+  select: (selection) => selections.push(selection),
+}
+const fakeAgent = { model: fakeModel, status: 'idle', session: { id: 'session-m' } }
+const fakeLlm = {
+  listProviders: async () => [{ id: 'p1', name: 'P1' }, { id: 'p2', name: 'P2' }],
+  listModels: async (provider) => (provider === 'p1'
+    ? [{ id: 'm1', name: 'M1' }, { id: 'm2', name: 'M2' }]
+    : [{ id: 'n1', name: 'N1' }]),
+  resolveModelInfo: async () => ({ reasoning: { efforts: [{ id: 'low' }, { id: 'high' }], defaultEffort: 'low' } }),
+}
+const modelCtx = {
+  agents: { get: (id) => (id === 'session-m' ? fakeAgent : undefined) },
+  get: (name) => (name === 'llm' ? fakeLlm : undefined),
+}
+const modelConfig = { sessionId: 'session-m' }
+assert.match(await modelCommand(modelCtx, modelConfig, ''), /当前：p1\/m1/)
+assert.match(await modelCommand(modelCtx, modelConfig, 'm2'), /已切到 p1\/m2/)
+assert.deepEqual(selections.at(-1), { provider: 'p1', model: 'm2', reasoningEffort: 'low' })
+assert.match(await modelCommand(modelCtx, modelConfig, 'n1'), /已切到 p2\/n1/)
+selections.length = 0
+assert.match(await thinkCommand(modelCtx, modelConfig, ''), /可选：low \/ high/)
+assert.match(await thinkCommand(modelCtx, modelConfig, 'high'), /已设为 high/)
+assert.deepEqual(selections.at(-1), { provider: 'p1', model: 'm1', reasoningEffort: 'high' })
+assert.match(await thinkCommand(modelCtx, modelConfig, 'nope'), /没有这个档位/)
+assert.match(
+  await modelCommand({ agents: { get: () => undefined }, get: () => undefined }, { sessionId: 'none' }, ''),
+  /未激活/,
+)
+
 console.log('smoke ok: 3 tools registered, schemas valid, credentials precedence, '
   + 'inbound helpers, error paths, identified-message contract, /new switching, '
   + 'plain-text inbound bodies, automatic turn delivery, streaming cards, and '

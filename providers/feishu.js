@@ -369,6 +369,31 @@ export async function sendCard(base, token, { receiveId, receiveIdType, cardId }
   return String(payload?.data?.message_id ?? '')
 }
 
+/**
+ * Create one CardKit entity from arbitrary card JSON.
+ *
+ * The streaming reply card is built by `createCard`; interactive question cards
+ * need their own layout (buttons, header, status line), so they come through
+ * here and reuse `sendCard` for delivery.
+ */
+export async function createCardFromJson(base, token, { card }, signal) {
+  const response = await fetch(`${base}/open-apis/cardkit/v1/cards`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json; charset=utf-8',
+      authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ type: 'card_json', data: JSON.stringify(card) }),
+    signal,
+  })
+  const payload = await response.json().catch(() => undefined)
+  const cardId = payload?.data?.card_id
+  if (!response.ok || !cardId) {
+    throw new Error(feishuError(payload, `Feishu card create failed (HTTP ${response.status})`))
+  }
+  return String(cardId)
+}
+
 export async function updateCardText(base, token, { cardId, content, sequence, elementId = CARD_ELEMENT_ID }, signal) {
   const response = await fetch(
     `${base}/open-apis/cardkit/v1/cards/${encodeURIComponent(cardId)}/elements/${encodeURIComponent(elementId)}/content`,
@@ -562,6 +587,25 @@ export function parseInboundEvent(event) {
   }
 }
 
+/**
+ * Normalize one `card.action.trigger` payload.
+ *
+ * The dispatcher flattens schema-2.0 envelopes (`{ schema, header, event }`)
+ * into `{ ...header, ...event }`, so `context`/`action`/`operator` sit at the
+ * top level; tests and older callers may pass the nested `{ event }` shape.
+ * The button value is user-defined, so it stays opaque here.
+ */
+export function normalizeCardAction(data) {
+  const event = data?.event ?? data ?? {}
+  const context = event?.context ?? data?.context ?? {}
+  const messageId = String(context?.open_message_id ?? event?.open_message_id ?? '')
+  const chatId = String(context?.open_chat_id ?? event?.open_chat_id ?? '')
+  const operatorId = String(event?.operator?.open_id ?? event?.operator_id?.open_id ?? '')
+  const value = event?.action?.value
+  if (!messageId || !value || typeof value !== 'object') return null
+  return { messageId, chatId, operatorId, value }
+}
+
 // ---------------------------------------------------------------------------
 // Provider
 // ---------------------------------------------------------------------------
@@ -629,6 +673,7 @@ export function createFeishuProvider(config = {}, deps = {}) {
     },
 
     parseInbound: parseInboundEvent,
+    normalizeCardAction,
 
     async downloadImage({ messageId, imageKey }, signal) {
       const resolved = await settingsAsync()
@@ -641,6 +686,10 @@ export function createFeishuProvider(config = {}, deps = {}) {
       async create({ text, summary }, signal) {
         const resolved = await settingsAsync()
         return await createCard(resolved.baseUrl, await token(signal), { text, summary }, signal)
+      },
+      async createRaw({ card }, signal) {
+        const resolved = await settingsAsync()
+        return await createCardFromJson(resolved.baseUrl, await token(signal), { card }, signal)
       },
       async attach({ chatId, cardId }, signal) {
         const resolved = await settingsAsync()
@@ -745,9 +794,10 @@ export function createFeishuProvider(config = {}, deps = {}) {
     /**
      * Long connection: the Feishu SDK owns reconnect, auth and decryption.
      * `onEvent(data)` receives one `im.message.receive_v1` payload;
-     * `onState({ ready, error })` publishes transport health.
+     * `onCardAction(data)` receives one flattened `card.action.trigger`
+     * payload; `onState({ ready, error })` publishes transport health.
      */
-    async connect({ onEvent, onState }, signal) {
+    async connect({ onEvent, onState, onCardAction }, signal) {
       const resolved = await settingsAsync()
       if (!resolved.appId || !resolved.appSecret) {
         onState?.({ ready: false, error: 'missing appId/appSecret' })
@@ -773,6 +823,16 @@ export function createFeishuProvider(config = {}, deps = {}) {
               await onEvent(data)
             } catch (error) {
               log({ event: 'channel', result: 'handler-failed', reason: error instanceof Error ? error.message : String(error) })
+            }
+          },
+          // Interactive card buttons: the answer travels back through the same
+          // long connection as message events (no callback URL needed).
+          'card.action.trigger': async (data) => {
+            try {
+              return await onCardAction?.(data)
+            } catch (error) {
+              log({ event: 'channel', result: 'card-handler-failed', reason: error instanceof Error ? error.message : String(error) })
+              return undefined
             }
           },
         })
