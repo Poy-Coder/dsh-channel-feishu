@@ -4,6 +4,14 @@
   "type": "module",
   "description": "Feishu/Lark (飞书) channel for DeepSeek Harness: a chat bound to a DSH session, with streaming cards and attachments.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Poy-Coder/dsh-channel-feishu.git"
+  },
+  "homepage": "https://github.com/Poy-Coder/dsh-channel-feishu#readme",
+  "bugs": {
+    "url": "https://github.com/Poy-Coder/dsh-channel-feishu/issues"
+  },
   "keywords": [
     "dsh",
     "deepseek-harness",
@@ -41,8 +49,5 @@
   },
   "engines": {
     "node": ">=20.18.1"
-  },
-  "publishConfig": {
-    "access": "public"
   }
 }
