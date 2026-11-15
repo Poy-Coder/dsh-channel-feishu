@@ -1297,6 +1297,9 @@ export async function handleInboundEvent(ctx, config, data, seen) {
 
   // Control phrases are consumed here, never delivered to the model.
   // `/new` still starts a fresh conversation; `/help` lists the rest.
+  // Any accepted inbound counts as channel activity, commands included, so the
+  // idle-release timer and `/status` see the truth.
+  lastInboundAt = Date.now()
   const command = parseSlashCommand(text)
   if (command) {
     await handleSlashCommand(ctx, config, { ...command, chatId, senderId })
