@@ -743,6 +743,42 @@ assert.match(statusReport, /工作区：C:\\tmp\\feishu-ws/)
 assert.match(statusReport, /权限：danger-full-access/)
 assert.match(statusReport, /目标群：oc_x/)
 
+// 17. Thinking process + reaction acknowledgement: CoT events are well-formed and
+// the provider talks to the documented endpoints.
+const { cotEvent } = await import('../index.js')
+const firstCot = cotEvent('RUN_STARTED', { threadId: 'oc_x', runId: 'turn-1' })
+const secondCot = cotEvent('RUN_FINISHED', { status: 'done' })
+assert.equal(firstCot.event_type, 'RUN_STARTED')
+assert.deepEqual(JSON.parse(firstCot.content), { threadId: 'oc_x', runId: 'turn-1' })
+assert.ok(Number(secondCot.timestamp) > Number(firstCot.timestamp), 'CoT timestamps must strictly increase')
+assert.ok(cotEvent('TEXT_MESSAGE_CONTENT', { delta: 'x'.repeat(5000) }).content.length <= 4200)
+
+const cotCalls = []
+globalThis.fetch = async (url, init) => {
+  const target = String(url)
+  cotCalls.push({ url: target, method: init?.method })
+  if (target.includes('tenant_access_token')) {
+    return { ok: true, status: 200, json: async () => ({ tenant_access_token: 't-fake', expire: 7200 }) }
+  }
+  if (target.includes('/message_cot') && init?.method === 'POST') {
+    return { ok: true, status: 200, json: async () => ({ code: 0, data: { cot_id: 'cot_1', message_id: 'om_cot' } }) }
+  }
+  if (target.includes('/reactions') && init?.method === 'POST') {
+    return { ok: true, status: 200, json: async () => ({ code: 0, data: { reaction_id: 'rx_1' } }) }
+  }
+  return { ok: true, status: 200, json: async () => ({ code: 0, data: {} }) }
+}
+process.env.DSH_HOME = credsHome
+const { createFeishuProvider } = await import('../providers/feishu.js')
+const cotProvider = createFeishuProvider({})
+assert.deepEqual(await cotProvider.cotCreate({ chatId: 'oc_x' }), { cotId: 'cot_1', messageId: 'om_cot' })
+await cotProvider.cotWrite({ cotId: 'cot_1', messageId: 'om_cot', events: [firstCot] })
+assert.equal(await cotProvider.addReaction({ messageId: 'om_1' }), 'rx_1')
+await cotProvider.removeReaction({ messageId: 'om_1', reactionId: 'rx_1' })
+assert.ok(cotCalls.some((call) => call.url.includes('/message_cot')), 'the CoT endpoint must be used')
+assert.ok(cotCalls.some((call) => call.url.includes('/reactions')), 'the reaction endpoint must be used')
+globalThis.fetch = realFetch
+
 console.log('smoke ok: 3 tools registered, schemas valid, credentials precedence, '
   + 'inbound helpers, error paths, identified-message contract, /new switching, '
   + 'plain-text inbound bodies, automatic turn delivery, streaming cards, and '

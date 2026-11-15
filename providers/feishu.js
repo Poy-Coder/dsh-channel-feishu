@@ -311,10 +311,20 @@ function cardJson(text, summary) {
         print_strategy: 'fast',
       },
       update_multi: true,
+      width_mode: 'fill',
       summary: { content: summary },
     },
     body: {
-      elements: [{ tag: 'markdown', element_id: CARD_ELEMENT_ID, content: text || ' ' }],
+      elements: [
+        { tag: 'markdown', element_id: CARD_ELEMENT_ID, content: text || ' ' },
+        { tag: 'hr' },
+        {
+          tag: 'markdown',
+          element_id: 'note_1',
+          content: '<font color="grey">流式输出中</font>',
+          text_size: 'notation',
+        },
+      ],
     },
   }
 }
@@ -359,9 +369,9 @@ export async function sendCard(base, token, { receiveId, receiveIdType, cardId }
   return String(payload?.data?.message_id ?? '')
 }
 
-export async function updateCardText(base, token, { cardId, content, sequence }, signal) {
+export async function updateCardText(base, token, { cardId, content, sequence, elementId = CARD_ELEMENT_ID }, signal) {
   const response = await fetch(
-    `${base}/open-apis/cardkit/v1/cards/${encodeURIComponent(cardId)}/elements/${CARD_ELEMENT_ID}/content`,
+    `${base}/open-apis/cardkit/v1/cards/${encodeURIComponent(cardId)}/elements/${encodeURIComponent(elementId)}/content`,
     {
       method: 'PUT',
       headers: {
@@ -638,14 +648,98 @@ export function createFeishuProvider(config = {}, deps = {}) {
           receiveId: chatId, receiveIdType: 'chat_id', cardId,
         }, signal)
       },
-      async update({ cardId, content, sequence }, signal) {
+      async update({ cardId, content, sequence, elementId }, signal) {
         const resolved = await settingsAsync()
-        await updateCardText(resolved.baseUrl, await token(signal), { cardId, content, sequence }, signal)
+        await updateCardText(resolved.baseUrl, await token(signal), { cardId, content, sequence, elementId }, signal)
       },
       async close({ cardId, sequence, summary }, signal) {
         const resolved = await settingsAsync()
         await closeCard(resolved.baseUrl, await token(signal), { cardId, sequence, summary }, signal)
       },
+    },
+
+    // --- thinking process (native CoT) -------------------------------------
+    // One POST opens the run, PUT appends AG-UI events, RUN_FINISHED closes it.
+    async cotCreate({ chatId, replyTo, hidden = false }, signal) {
+      const resolved = await settingsAsync()
+      const response = await fetch(`${resolved.baseUrl}/open-apis/im/v1/message_cot?receive_id_type=chat_id`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json; charset=utf-8',
+          authorization: `Bearer ${await token(signal)}`,
+        },
+        body: JSON.stringify({
+          receive_id: chatId,
+          ...(replyTo ? { origin_message_id: replyTo } : {}),
+          cot_hidden: hidden,
+          enable_badge: false,
+          update_feed_rank: false,
+        }),
+        signal,
+      })
+      const payload = await response.json().catch(() => undefined)
+      const cotId = payload?.data?.cot_id
+      const messageId = payload?.data?.message_id
+      if (!response.ok || !cotId || !messageId) {
+        throw new Error(feishuError(payload, `Feishu CoT create failed (HTTP ${response.status})`))
+      }
+      return { cotId: String(cotId), messageId: String(messageId) }
+    },
+
+    async cotWrite({ cotId, messageId, events }, signal) {
+      const resolved = await settingsAsync()
+      const response = await fetch(`${resolved.baseUrl}/open-apis/im/v1/message_cot`, {
+        method: 'PUT',
+        headers: {
+          'content-type': 'application/json; charset=utf-8',
+          authorization: `Bearer ${await token(signal)}`,
+        },
+        body: JSON.stringify({ events, message_id: messageId, cot_id: cotId }),
+        signal,
+      })
+      const payload = await response.json().catch(() => undefined)
+      if (!response.ok || (payload?.code !== undefined && payload.code !== 0)) {
+        throw new Error(feishuError(payload, `Feishu CoT write failed (HTTP ${response.status})`))
+      }
+    },
+
+    // --- reactions ----------------------------------------------------------
+    async addReaction({ messageId, emoji = 'THINKING' }, signal) {
+      const resolved = await settingsAsync()
+      const response = await fetch(
+        `${resolved.baseUrl}/open-apis/im/v1/messages/${encodeURIComponent(messageId)}/reactions`,
+        {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json; charset=utf-8',
+            authorization: `Bearer ${await token(signal)}`,
+          },
+          body: JSON.stringify({ reaction_type: { emoji_type: emoji } }),
+          signal,
+        },
+      )
+      const payload = await response.json().catch(() => undefined)
+      const reactionId = payload?.data?.reaction_id
+      if (!response.ok || !reactionId) {
+        throw new Error(feishuError(payload, `Feishu reaction add failed (HTTP ${response.status})`))
+      }
+      return String(reactionId)
+    },
+
+    async removeReaction({ messageId, reactionId }, signal) {
+      const resolved = await settingsAsync()
+      const response = await fetch(
+        `${resolved.baseUrl}/open-apis/im/v1/messages/${encodeURIComponent(messageId)}/reactions/${encodeURIComponent(reactionId)}`,
+        {
+          method: 'DELETE',
+          headers: { authorization: `Bearer ${await token(signal)}` },
+          signal,
+        },
+      )
+      const payload = await response.json().catch(() => undefined)
+      if (!response.ok || (payload?.code !== undefined && payload.code !== 0)) {
+        throw new Error(feishuError(payload, `Feishu reaction remove failed (HTTP ${response.status})`))
+      }
     },
 
     /**

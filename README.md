@@ -64,10 +64,10 @@ sidecar（`feishu-channel-state.json` 的 `chats`，以及进程内的 chat memo
 dsh plugin add dsh-channel-feishu
 ```
 
-或用 Release 里的压缩包（`v0.7.0` 起附带）：
+或用 Release 里的压缩包（`v0.7.1` 起附带）：
 
 ```bash
-dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.7.0/dsh-channel-feishu-0.7.0.tgz
+dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.7.1/dsh-channel-feishu-0.7.1.tgz
 ```
 
 依赖必须用扁平结构装（非 ASCII 目录下 pnpm 的软链会把路径写坏）：
@@ -102,10 +102,10 @@ pnpm install --node-linker=hoisted
 
 | 想要 | 接口 | 需要的权限 | 本应用现状 |
 |---|---|---|---|
-| 应用可见范围内所有用户 open_id | `GET /open-apis/contact/v3/scopes` | 无需额外权限 | ✅ 可用，返回 `ou_xxxxxxxxxxxx`（= 应用创建者/你本人） |
-| 邮箱或手机号 → open_id | `POST /open-apis/contact/v3/users/batch_get_id?user_id_type=open_id`，body `{"emails":["..."]}` | `contact:user.id:readonly` | ⚠️ 未开通（报 99991672，按返回里的链接申请即可） |
-| 机器人所在群列表 → `oc_...` | `GET /open-apis/im/v1/chats` | `im:chat:read` | ✅ 可用（当前为空：机器人还没进群） |
-| 发送者是谁（事件回调） | 订阅 `im.message.receive_v1`，读事件里的 `sender.sender_id.open_id` | `im:message.p2p_msg:readonly` | ✅ 已具备权限；回调已是 **websocket 长连接**模式 |
+| 应用可见范围内所有用户 open_id | `GET /open-apis/contact/v3/scopes` | 无需额外权限 |  可用，返回 `ou_xxxxxxxxxxxx`（= 应用创建者/你本人） |
+| 邮箱或手机号 → open_id | `POST /open-apis/contact/v3/users/batch_get_id?user_id_type=open_id`，body `{"emails":["..."]}` | `contact:user.id:readonly` |  未开通（报 99991672，按返回里的链接申请即可） |
+| 机器人所在群列表 → `oc_...` | `GET /open-apis/im/v1/chats` | `im:chat:read` |  可用（当前为空：机器人还没进群） |
+| 发送者是谁（事件回调） | 订阅 `im.message.receive_v1`，读事件里的 `sender.sender_id.open_id` | `im:message.p2p_msg:readonly` |  已具备权限；回调已是 **websocket 长连接**模式 |
 | user_id（企业内标识） | `contact:user.employee_id:readonly`（user token）或管理后台导出 | 按接口 | 未开通；机器人发送用 open_id 就够 |
 
 本机实测结论（应用 `示例应用` / `cli_xxxxxxxxxxxx`）：

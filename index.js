@@ -77,6 +77,9 @@ export const Config = z.object({
   notifyOnNew: z.boolean().default(true).description('Reply on the IM when /new creates a session.'),
   streamingCards: z.boolean().default(true).description('Stream answers into a card; off sends plain text.'),
   autoReply: z.boolean().default(true).description('Deliver each turn\u2019s answer back to the originating chat.'),
+  thinking: z.boolean().default(true).description('Show the native thinking process (reasoning and tool calls) during a turn.'),
+  thinkingHidden: z.boolean().default(false).description('Hide the thinking process once the turn finishes.'),
+  reactions: z.boolean().default(true).description('Acknowledge an inbound message with a reaction while the turn runs.'),
   permissionPreset: z.string().default('danger-full-access').description('Permission preset applied to sessions in this channel\u2019s workspace.'),
   applyPermissionPreset: z.boolean().default(true).description('Turn the permission preset switch off.'),
   region: z.union([z.const('feishu'), z.const('lark')]).default('feishu').description('Feishu China or Lark international.'),
@@ -152,10 +155,99 @@ function destination(settings, args) {
 //   - finalize: `turn/end` closes the card (or falls back to a text message)
 // ---------------------------------------------------------------------------
 
-const CARD_FLUSH_MS = 60
+const CARD_FLUSH_MS = 200
+const MAX_CARD_UPDATES = 240
 const MAX_REPLY_CHARS = 15_000
 const CHAT_MEMORY = new Map()
 const turns = new Map()
+
+// `agent/assistant-stream` is published on the agent's own context, so a
+// plugin-level listener never receives it; subscribe once per agent.
+const streamWatchers = new Map()
+/** Last turn seen in a `start` frame — `chunk` and `end` frames do not carry one. */
+const streamTurn = new Map()
+let streamFrames = 0
+const streamChunks = { text: 0, reasoning: 0, other: 0 }
+let flushScheduled = 0
+let flushRan = 0
+const observeStats = { mismatch: 0, noFrame: 0, start: 0, end: 0, chunk: 0 }
+let lastObserve = ''
+let lastStreamShape = ''
+let channelRuntime
+
+const describeShape = (value) => {
+  if (value === null || value === undefined) return String(value)
+  if (typeof value !== 'object') return typeof value
+  const keys = Object.keys(value).slice(0, 12)
+  const parts = keys.map((key) => {
+    const inner = value[key]
+    if (inner === null || inner === undefined) return `${key}:${String(inner)}`
+    return `${key}:${typeof inner === 'object' ? 'obj' : typeof inner}`
+  })
+  return `{${parts.join(',')}}`
+}
+
+/** Counters for `/status` and the diagnostics log. */
+export function streamStats() {
+  return {
+    frames: streamFrames,
+    watchers: streamWatchers.size,
+    textChunks: streamChunks.text,
+    reasoningChunks: streamChunks.reasoning,
+    otherChunks: streamChunks.other,
+    flushScheduled,
+    flushRan,
+    mismatch: observeStats.mismatch,
+    noFrame: observeStats.noFrame,
+    start: observeStats.start,
+    end: observeStats.end,
+    chunk: observeStats.chunk,
+  }
+}
+
+/** Subscribe the channel to one agent's live token stream (idempotent). */
+export function watchAgentStreams(agent, runtime = channelRuntime) {
+  const session = agent?.session
+  const id = session?.id ?? agent?.id
+  if (!id || streamWatchers.has(id)) return false
+  if (typeof agent?.ctx?.on !== 'function') return false
+  // Only the channel's own sessions matter: the target session, or any session
+  // living in the channel's workspace.
+  const config = runtime?.config ?? {}
+  const target = String(config.sessionId ?? '').trim() || (runtime ? currentSessionId(config) : '')
+  const workspace = runtime ? normalizePath(workspacePathFor(config)) : ''
+  const relevant = (target && id === target) || (workspace && normalizePath(session?.header?.cwd) === workspace)
+  if (!relevant) return false
+  try {
+    const off = agent.ctx.on('agent/assistant-stream', (payload) => {
+      streamFrames += 1
+      if (streamFrames === 1) {
+        lastStreamShape = `payload=${describeShape(payload)} frame=${describeShape(payload?.frame)}`
+        logInbound(runtime?.config ?? {}, { event: 'debug', result: 'stream-shape', shape: lastStreamShape })
+      }
+      // `start` carries turn/step; `chunk` and `end` do not, so remember it.
+      const frame = payload?.frame
+      if (frame?.type === 'start' && Number.isFinite(frame.turn)) streamTurn.set(id, frame.turn)
+      const turn = Number.isFinite(frame?.turn) ? frame.turn : streamTurn.get(id)
+      // DSH emits `{ frame, agent }`; the session id comes from this
+      // subscription, so a payload without `agent` still resolves.
+      if (runtime) observeAssistantStream(runtime.ctx, runtime.config, payload, id, turn)
+    })
+    streamWatchers.set(id, off)
+    return true
+  } catch {
+    return false
+  }
+}
+
+function disposeAgentStreams() {
+  for (const off of streamWatchers.values()) {
+    try { off?.() } catch { /* ignore */ }
+  }
+  streamWatchers.clear()
+  streamTurn.clear()
+}
+
 
 function replyTargetOf(config, sessionId) {
   return CHAT_MEMORY.get(sessionId) || provider().settings().defaultChatId
@@ -206,7 +298,7 @@ function turnRecord(sessionId, turn) {
     key, sessionId, turn,
     committed: '', stepStream: '', stepBlocks: new Set(),
     card: undefined, cardFailed: false, sentByTool: false, lastCardText: '', updates: 0,
-    timer: undefined, lastSentAt: 0,
+    backoffUntil: 0, cardCreating: undefined, timer: undefined, lastSentAt: 0, phase: 'thinking',
   }
   turns.set(key, record)
   if (turns.size > 64) {
@@ -224,11 +316,15 @@ function textOfMessage(message) {
     .join('')
 }
 
+/** Shown from turn start until the first answer token arrives. */
+const THINKING_TEXT = '思考中…'
+
 /** The text a card/text reply should carry right now: committed steps + live deltas. */
 function replyText(record) {
   const head = String(record.committed ?? '').trimEnd()
   const tail = String(record.stepStream ?? '')
   const joined = [head, tail].filter(Boolean).join(head && tail ? '\n\n' : '')
+  if (!joined) return record.phase === 'answering' ? '' : THINKING_TEXT
   if (joined.length <= MAX_REPLY_CHARS) return joined
   return `${joined.slice(0, MAX_REPLY_CHARS)}\n\n…（内容过长，已截断）`
 }
@@ -238,36 +334,69 @@ function summaryOf(text) {
   return line.length > 40 ? `${line.slice(0, 40)}…` : line
 }
 
+/**
+ * Create the turn's card exactly once, even when several flushes race: without
+ * the single-flight guard two in-flight flushes each created a card, the chat
+ * rate limit kicked in (230020), and the reply fell back to text as well.
+ */
 async function ensureCard(record, ctx, config) {
   if (record.card) return record.card
   if (record.cardFailed) return undefined
+  if (record.cardCreating) return await record.cardCreating
   const chatId = replyTargetOf(config, record.sessionId)
   if (!chatId) return undefined
   const text = replyText(record)
-  try {
-    const cardId = await provider().card.create({ text, summary: summaryOf(text) })
-    const messageId = await provider().card.attach({ chatId, cardId })
-    record.card = { cardId, messageId, sequence: 1 }
-    record.lastCardText = text
-    record.lastSentAt = Date.now()
-    logInbound(config, {
-      event: 'card', result: 'created', sessionId: record.sessionId, turn: record.turn, cardId, messageId, chatId,
-    })
-    return record.card
-  } catch (error) {
-    record.cardFailed = true
-    warnTo(ctx, `streaming card failed, will fall back to text: ${errorText(error)}`)
-    logInbound(config, {
-      event: 'card', result: 'create-failed', sessionId: record.sessionId, turn: record.turn, reason: errorText(error),
-    })
-    return undefined
-  }
+  record.cardCreating = (async () => {
+    const attempt = async () => {
+      const cardId = await provider().card.create({ text, summary: summaryOf(text) })
+      const messageId = await provider().card.attach({ chatId, cardId })
+      return { cardId, messageId }
+    }
+    try {
+      let created
+      try {
+        created = await attempt()
+      } catch (error) {
+        if (!isRateLimited(error)) throw error
+        // Chat-level limits are transient: wait once and retry before giving up.
+        await new Promise((resolve) => { const t = setTimeout(resolve, 1_500); t.unref?.() })
+        created = await attempt()
+      }
+      record.card = { cardId: created.cardId, messageId: created.messageId, sequence: 1 }
+      record.lastCardText = text
+      record.lastSentAt = Date.now()
+      logInbound(config, {
+        event: 'card', result: 'created', sessionId: record.sessionId, turn: record.turn,
+        cardId: created.cardId, messageId: created.messageId, chatId,
+      })
+      return record.card
+    } catch (error) {
+      record.cardFailed = true
+      warnTo(ctx, `streaming card failed, will fall back to text: ${errorText(error)}`)
+      logInbound(config, {
+        event: 'card', result: 'create-failed', sessionId: record.sessionId, turn: record.turn, reason: errorText(error),
+      })
+      return undefined
+    } finally {
+      record.cardCreating = undefined
+    }
+  })()
+  return await record.cardCreating
 }
 
 /** Coalesce stream deltas: one Feishu write per CARD_FLUSH_MS at most. */
 function scheduleCardFlush(record, ctx, config) {
   if (record.timer) return
-  const delay = Math.max(0, CARD_FLUSH_MS - (Date.now() - record.lastSentAt))
+  // Feishu documents ~8 card writes/second; 200 ms keeps us well under it, and a
+  // rate-limit answer pushes the next write out by the backoff instead of
+  // spamming.
+  if (record.updates >= MAX_CARD_UPDATES) return
+  flushScheduled += 1
+  const delay = Math.max(
+    0,
+    CARD_FLUSH_MS - (Date.now() - record.lastSentAt),
+    (record.backoffUntil ?? 0) - Date.now(),
+  )
   record.timer = setTimeout(() => {
     record.timer = undefined
     void flushCard(record, ctx, config)
@@ -275,7 +404,10 @@ function scheduleCardFlush(record, ctx, config) {
   record.timer.unref?.()
 }
 
+const isRateLimited = (error) => /230020|frequency limit|rate limit/i.test(String(error?.message ?? error))
+
 async function flushCard(record, ctx, config) {
+  flushRan += 1
   const text = replyText(record)
   if (!text.trim()) return
   // One write in flight per card: a second PATCH started before the first
@@ -295,11 +427,20 @@ async function flushCard(record, ctx, config) {
     record.updates = (record.updates ?? 0) + 1
     record.lastSentAt = Date.now()
   } catch (error) {
-    record.cardFailed = true
-    warnTo(ctx, `card text update failed, will fall back to text: ${errorText(error)}`)
-    logInbound(config, {
-      event: 'card', result: 'update-failed', sessionId: record.sessionId, turn: record.turn, reason: errorText(error),
-    })
+    if (isRateLimited(error)) {
+      // Keep the card: slow down instead of dropping to text, which would need
+      // another message and hit the same limit.
+      record.backoffUntil = Date.now() + 2_000
+      logInbound(config, {
+        event: 'card', result: 'rate-limited', sessionId: record.sessionId, turn: record.turn, sequence: card.sequence,
+      })
+    } else {
+      record.cardFailed = true
+      warnTo(ctx, `card text update failed, will fall back to text: ${errorText(error)}`)
+      logInbound(config, {
+        event: 'card', result: 'update-failed', sessionId: record.sessionId, turn: record.turn, reason: errorText(error),
+      })
+    }
   } finally {
     record.flushing = false
     if (record.flushPending) {
@@ -322,11 +463,39 @@ export async function finalizeTurn(ctx, config, sessionId, turn, reason) {
     clearTimeout(record.timer)
     record.timer = undefined
   }
+  // Drop the acknowledgement reaction now that the turn is over.
+  const ack = ackReactions.get(sessionId)
+  if (ack) {
+    ackReactions.delete(sessionId)
+    void provider().removeReaction(ack).catch(() => {})
+  }
   const text = replyText(record).trim()
   const chatId = replyTargetOf(config, sessionId)
   const cardsOn = config.streamingCards !== false
 
-  if (!text) {
+  // Nothing but the placeholder: finish the card with a clear note instead of
+  // leaving a "thinking" card open forever.
+  if (!text || text === THINKING_TEXT) {
+    if (cardsOn && record.card) {
+      const note = reason?.kind === 'error' ? '（这一轮出错了，没有产生回复）' : '（没有产生文字回答）'
+      try {
+        record.card.sequence += 1
+        await provider().card.update({
+          cardId: record.card.cardId, content: note, sequence: record.card.sequence,
+        })
+        record.card.sequence += 1
+        await provider().card.close({
+          cardId: record.card.cardId, sequence: record.card.sequence, summary: note,
+        })
+        logInbound(config, {
+          event: 'card', result: 'closed', sessionId, turn, cardId: record.card.cardId,
+          chars: 0, updates: record.updates ?? 0, note: 'empty',
+        })
+        return
+      } catch (error) {
+        warnTo(ctx, `card close (empty) failed: ${errorText(error)}`)
+      }
+    }
     if (reason?.kind === 'error' && chatId) {
       try {
         await sendChannelText(config, chatId, '这一轮处理出错了，没有产生回复。')
@@ -339,15 +508,57 @@ export async function finalizeTurn(ctx, config, sessionId, turn, reason) {
     const card = await ensureCard(record, ctx, config)
     if (card) {
       try {
+        // The engine can hand over the whole answer in one burst, which would
+        // land as a single jump. When that happens, replay the text in slices so
+        // the reader still sees it appear progressively.
+        const shown = String(record.lastCardText ?? '').length
+        const burst = (record.updates ?? 0) < 8 && text.length > 80 && shown < text.length
+        if (burst) {
+          // ~10 characters per tick, 150 ms apart, with the network round trip
+          // subtracted so the cadence does not stretch to RTT + sleep.
+          const tick = 150
+          const size = Math.max(6, Math.ceil(text.length / 40))
+          for (let end = Math.min(shown + size, text.length); end < text.length; end += size) {
+            const started = Date.now()
+            card.sequence += 1
+            await provider().card.update({
+              cardId: card.cardId, content: text.slice(0, end), sequence: card.sequence,
+            })
+            record.updates = (record.updates ?? 0) + 1
+            const spent = Date.now() - started
+            await new Promise((resolve) => { const t = setTimeout(resolve, Math.max(0, tick - spent)); t.unref?.() })
+          }
+          record.lastCardText = ''
+        }
         if (text !== record.lastCardText) {
           card.sequence += 1
           await provider().card.update({ cardId: card.cardId, content: text, sequence: card.sequence })
           record.lastCardText = text
         }
+        // Footer flips from "streaming" to "done" before the card freezes.
+        try {
+          card.sequence += 1
+          await provider().card.update({
+            cardId: card.cardId,
+            content: '<font color="grey">完成</font>',
+            sequence: card.sequence,
+            elementId: 'note_1',
+          })
+        } catch { /* footer is cosmetic */ }
         card.sequence += 1
-        await provider().card.close({
-          cardId: card.cardId, sequence: card.sequence, summary: summaryOf(text),
-        })
+        try {
+          await provider().card.close({
+            cardId: card.cardId, sequence: card.sequence, summary: summaryOf(text),
+          })
+        } catch (error) {
+          // The final write is the one that must land: back off once, then retry.
+          if (!isRateLimited(error)) throw error
+          await new Promise((resolve) => { const t = setTimeout(resolve, 1_500); t.unref?.() })
+          card.sequence += 1
+          await provider().card.close({
+            cardId: card.cardId, sequence: card.sequence, summary: summaryOf(text),
+          })
+        }
         logInbound(config, {
           event: 'card', result: 'closed', sessionId, turn, cardId: card.cardId, chars: text.length,
           updates: record.updates ?? 0,
@@ -388,51 +599,227 @@ export function observeSessionEvent(ctx, config, session, event) {
   if (!target || session?.id !== target) return
   const data = event?.data ?? {}
   if (event.type === 'turn/start') {
-    turnRecord(target, data.turn)
+    const record = turnRecord(target, data.turn)
+    // Thinking process first (its create round trip overlaps the model's time to
+    // first token), then the card placeholder.
+    ensureCotRun(ctx, config, target, data.turn)
+    void ensureCard(record, ctx, config).catch(() => {})
+    return
+  }
+  if (event.type === 'tool/call') {
+    if (data.name === 'feishu_send_message') turnRecord(target, data.turn).sentByTool = true
+    const run = cotRuns.get(`${target}|${data.turn}`)
+    if (run) {
+      if (run.reasoningOpen) {
+        run.reasoningOpen = false
+        cotEnqueue(run, cotEvent('REASONING_MESSAGE_END', { messageId: `reasoning-${data.turn}` }))
+      }
+      cotEnqueue(run,
+        cotEvent('TOOL_CALL_START', {
+          toolCallId: data.callId, icon: 'default', title: String(data.name ?? 'tool'), toolCallName: data.name,
+        }),
+        cotEvent('TOOL_CALL_ARGS', { toolCallId: data.callId, delta: String(data.arguments ?? '') }),
+        cotEvent('TOOL_CALL_END', { toolCallId: data.callId }))
+    }
+    return
+  }
+  if (event.type === 'tool/result') {
+    const run = cotRuns.get(`${target}|${data.turn}`)
+    if (run) {
+      const text = textOfMessage(data.message)
+      cotEnqueue(run, cotEvent('TOOL_CALL_RESULT', {
+        messageId: `result-${data.callId}`,
+        toolCallId: data.callId,
+        role: 'tool',
+        content: { type: 'code', code: text.slice(0, 1500) },
+        ...(data.error ? { error: String(data.error.code ?? 'error') } : {}),
+      }))
+    }
     return
   }
   if (event.type === 'assistant/message') {
     const record = turnRecord(target, data.turn)
     const text = textOfMessage(data.message)
     if (!text) return
+    record.phase = 'answering'
     record.committed = record.committed ? `${record.committed}\n\n${text}` : text
     record.stepStream = ''
     record.stepBlocks = new Set()
     scheduleCardFlush(record, ctx, config)
     return
   }
-  if (event.type === 'tool/call' && data.name === 'feishu_send_message') {
-    turnRecord(target, data.turn).sentByTool = true
-    return
-  }
   if (event.type === 'turn/end') {
+    finishCotRun(config, target, data.turn, data.reason?.kind === 'error'
+      ? (data.reason.error?.message ?? 'turn failed')
+      : undefined)
     void finalizeTurn(ctx, config, target, data.turn, data.reason)
   }
 }
 
 /** Live stream feed: typewriter updates inside the current turn's card. */
-export function observeAssistantStream(ctx, config, payload) {
-  const agentId = payload?.agent?.id
+export function observeAssistantStream(ctx, config, payload, sessionId, turnHint) {
+  // DSH's emit carries `{ frame, agent }`; tests and older callers may pass `{ agent, frame }`.
+  const agentId = sessionId ?? payload?.agent?.id ?? payload?.id
   const target = activeSessionId(config)
-  if (!target || agentId !== target) return
+  if (!target || agentId !== target) {
+    observeStats.mismatch += 1
+    lastObserve = `mismatch target=${target} agent=${agentId}`
+    return
+  }
   const frame = payload?.frame
-  if (!frame || frame.turn === undefined) return
-  const record = turnRecord(agentId, frame.turn)
+  if (!frame) {
+    observeStats.noFrame += 1
+    lastObserve = `no-frame keys=${describeShape(payload)}`
+    return
+  }
+  // `chunk`/`end` frames carry no turn; the caller supplies the one from `start`.
+  const turn = Number.isFinite(turnHint) ? turnHint : frame.turn
+  if (!Number.isFinite(turn)) {
+    observeStats.noFrame += 1
+    lastObserve = `no-turn type=${String(frame.type)} keys=${describeShape(frame)}`
+    return
+  }
+  const record = turnRecord(agentId, turn)
   if (frame.type === 'start') {
+    observeStats.start += 1
     record.stepStream = ''
-    record.stepBlocks = new Set()
     return
   }
-  if (frame.type !== 'chunk') return
+  if (frame.type !== 'chunk') {
+    observeStats.end += 1
+    lastObserve = `non-chunk type=${String(frame.type)}`
+    return
+  }
+  observeStats.chunk += 1
   const chunk = frame.chunk
-  if (chunk?.type === 'block-start') {
-    if (chunk.blockType === 'text') record.stepBlocks.add(chunk.index)
+  // Reasoning goes to the native thinking process; only text builds the answer.
+  if (chunk?.type === 'reasoning-delta') {
+    streamChunks.reasoning += 1
+    appendCotReasoning(cotRuns.get(`${target}|${turn}`) ?? ensureCotRun(ctx, config, target, turn), chunk.text)
     return
   }
-  if (chunk?.type === 'text-delta' && record.stepBlocks.has(chunk.index)) {
-    record.stepStream += chunk.text
-    scheduleCardFlush(record, ctx, config)
+  if (chunk?.type === 'block-end' && chunk.block?.type === 'reasoning') {
+    streamChunks.reasoning += 1
+    appendCotReasoning(cotRuns.get(`${target}|${turn}`) ?? ensureCotRun(ctx, config, target, turn), chunk.block.text)
+    return
   }
+  // `text-delta` is text by definition, so no block bookkeeping is needed —
+  // requiring a prior block-start dropped every incremental update on the floor.
+  if (chunk?.type !== 'text-delta') {
+    streamChunks.other += 1
+    return
+  }
+  streamChunks.text += 1
+  record.phase = 'answering'
+  record.stepStream += chunk.text
+  scheduleCardFlush(record, ctx, config)
+}
+
+// ---------------------------------------------------------------------------
+// Thinking process (native CoT) and acknowledgement reactions
+//
+// A thinking process is its own Feishu message: POST opens it, PUT appends
+// AG-UI events, RUN_FINISHED closes it. It carries the reasoning and tool
+// activity, never the answer — that stays in the streaming card.
+// ---------------------------------------------------------------------------
+
+const COT_EVENT_MAX_CHARS = 4096
+const COT_BATCH = 50
+const cotRuns = new Map()
+const ackReactions = new Map()
+let cotStamp = 0
+
+/** Encode one AG-UI event with a strictly increasing timestamp and a bounded payload. */
+export function cotEvent(type, content) {
+  cotStamp = Math.max(Date.now(), cotStamp + 1)
+  const encoded = JSON.stringify(content ?? {})
+  return {
+    event_type: type,
+    content: encoded.length <= COT_EVENT_MAX_CHARS ? encoded : JSON.stringify({ truncated: true }),
+    timestamp: String(cotStamp),
+  }
+}
+
+async function cotDrain(run) {
+  const handle = await run.opening
+  if (!handle) {
+    run.pending.length = 0
+    return
+  }
+  while (run.pending.length > 0) {
+    const batch = run.pending.splice(0, COT_BATCH)
+    try {
+      await provider().cotWrite({ cotId: handle.cotId, messageId: handle.messageId, events: batch })
+    } catch (error) {
+      run.pending.length = 0
+      logInbound(run.config ?? {}, {
+        event: 'cot', result: 'write-failed', reason: errorText(error), sessionId: run.sessionId, turn: run.turn,
+      })
+      break
+    }
+  }
+}
+
+function cotEnqueue(run, ...events) {
+  if (run.finished && events.every((event) => event.event_type !== 'RUN_FINISHED' && event.event_type !== 'RUN_ERROR')) return
+  run.pending.push(...events)
+  run.draining = run.draining.then(() => cotDrain(run)).catch(() => {})
+}
+
+/** Open (once per turn) the thinking process; failures are presentation-only. */
+export function ensureCotRun(ctx, config, sessionId, turn) {
+  if (config.thinking === false) return undefined
+  const key = `${sessionId}|${turn}`
+  const existing = cotRuns.get(key)
+  if (existing) return existing
+  const chatId = replyTargetOf(config, sessionId)
+  const run = {
+    sessionId, turn, chatId, config, reasoningOpen: false, finished: false,
+    pending: [], draining: Promise.resolve(),
+    opening: (async () => {
+      if (!chatId) return undefined
+      try {
+        const handle = await provider().cotCreate({ chatId, hidden: config.thinkingHidden === true })
+        logInbound(config, {
+          event: 'cot', result: 'opened', sessionId, turn, cotId: handle.cotId, messageId: handle.messageId,
+        })
+        return handle
+      } catch (error) {
+        logInbound(config, { event: 'cot', result: 'open-failed', reason: errorText(error), sessionId, turn })
+        return undefined
+      }
+    })(),
+  }
+  cotRuns.set(key, run)
+  cotEnqueue(run, cotEvent('RUN_STARTED', { threadId: chatId, runId: `turn-${turn}` }))
+  return run
+}
+
+/** Close the run: a finished run, or the failure that ended the turn. */
+export function finishCotRun(config, sessionId, turn, failure) {
+  const key = `${sessionId}|${turn}`
+  const run = cotRuns.get(key)
+  if (!run || run.finished) return
+  run.finished = true
+  cotRuns.delete(key)
+  if (run.reasoningOpen) {
+    run.reasoningOpen = false
+    cotEnqueue(run, cotEvent('REASONING_MESSAGE_END', { messageId: `reasoning-${turn}` }))
+  }
+  cotEnqueue(run, failure
+    ? cotEvent('RUN_ERROR', { message: String(failure).slice(0, 500), code: 'TURN_FAILED' })
+    : cotEvent('RUN_FINISHED', { threadId: run.chatId, runId: `turn-${turn}`, status: 'done' }))
+}
+
+/** Reasoning text goes into the thinking process, never into the answer card. */
+function appendCotReasoning(run, text) {
+  if (!run || !text) return
+  const messageId = `reasoning-${run.turn}`
+  if (!run.reasoningOpen) {
+    run.reasoningOpen = true
+    cotEnqueue(run, cotEvent('REASONING_MESSAGE_START', { messageId, role: 'reasoning' }))
+  }
+  cotEnqueue(run, cotEvent('REASONING_MESSAGE_CONTENT', { messageId, delta: text }))
 }
 
 const sendMessageTool = (config) => ({
@@ -565,6 +952,14 @@ const statusTool = (config) => ({
         lastInboundAt: { type: 'number' },
         sessionId: { type: 'string' },
         workspacePath: { type: 'string' },
+        streamFrames: { type: 'number' },
+        streamWatchers: { type: 'number' },
+        textChunks: { type: 'number' },
+        reasoningChunks: { type: 'number' },
+        otherChunks: { type: 'number' },
+        flushScheduled: { type: 'number' },
+        flushRan: { type: 'number' },
+        streamShape: { type: 'string' },
         error: { type: 'string' },
       },
       required: ['configured', 'tokenOk'],
@@ -589,7 +984,14 @@ const statusTool = (config) => ({
           + `defaultChatId=${value.defaultChatId || '(none)'}\n${inbound}`
           + `\n会话=${value.sessionId || '(none)'} 工作区=${value.workspacePath || '(none)'} `
           + `自动回传=${value.autoReply ? 'on' : 'off'} 流式卡片=${value.streamingCards ? 'on' : 'off'}`
-          + `\n最近入站=${last}`,
+          + `\n最近入站=${last}`
+          + `\n流式帧=${value.streamFrames ?? 0} 订阅=${value.streamWatchers ?? 0}`
+          + ` 文本块=${value.textChunks ?? 0} 思考块=${value.reasoningChunks ?? 0} 其它=${value.otherChunks ?? 0}`
+          + `\n卡片调度=${value.flushScheduled ?? 0} 实跑=${value.flushRan ?? 0}`
+          + (value.streamShape ? `\n首帧结构=${value.streamShape}` : '')
+          + `\n观察：不符=${value.observeMismatch ?? 0} 无帧=${value.observeNoFrame ?? 0}`
+          + ` start=${value.observeStart ?? 0} end=${value.observeEnd ?? 0} chunk=${value.observeChunk ?? 0}`
+          + (value.lastObserve ? `\n最近=${value.lastObserve}` : ''),
       }]
     },
   },
@@ -610,6 +1012,20 @@ const statusTool = (config) => ({
       sessionId: String(currentSessionId(config) ?? ''),
       workspacePath: workspacePathFor(config),
       provider: provider().id,
+      streamFrames: streamStats().frames,
+      streamWatchers: streamStats().watchers,
+      textChunks: streamStats().textChunks,
+      reasoningChunks: streamStats().reasoningChunks,
+      otherChunks: streamStats().otherChunks,
+      flushScheduled: streamStats().flushScheduled,
+      flushRan: streamStats().flushRan,
+      streamShape: lastStreamShape,
+      lastObserve,
+      observeMismatch: observeStats.mismatch,
+      observeNoFrame: observeStats.noFrame,
+      observeStart: observeStats.start,
+      observeEnd: observeStats.end,
+      observeChunk: observeStats.chunk,
     }
   },
 })
@@ -1343,6 +1759,17 @@ export async function handleInboundEvent(ctx, config, data, seen) {
       source: { kind: 'user' },
     })
     rememberChat(config, sessionId, { chatId, senderId })
+    // Acknowledge on the user's own message: the cheapest "I got it" there is.
+    if (config.reactions !== false && inbound.messageId) {
+      void provider().addReaction({ messageId: inbound.messageId })
+        .then((reactionId) => {
+          if (reactionId) {
+            ackReactions.set(sessionId, { messageId: inbound.messageId, reactionId })
+            log({ event: 'reaction', result: 'added', messageId: inbound.messageId })
+          }
+        })
+        .catch((error) => log({ event: 'reaction', result: 'failed', reason: errorText(error) }))
+    }
   } catch (error) {
     warnTo(ctx, `inbound delivery failed for session "${sessionId}": ${errorText(error)}`)
     log({ event: 'inbound', result: 'error', reason: errorText(error), senderId, chatId, sessionId, via: resolved.via })
@@ -1373,18 +1800,19 @@ function startInbound(ctx, config) {
       // Outbound half: the answer to every inbound message travels back through
       // the durable-log feed, so no prompt instruction is needed.
       loadChatMemory(config)
+      channelRuntime = { ctx: scoped, config }
       // The active session may already be live from an earlier message; its
-      // policy must match the channel's preset even before the next inbound one.
+      // policy must match the channel's preset even before the next inbound one,
+      // and live tokens arrive only on the agent's own context.
       try {
         for (const liveAgent of scoped.agents?.list?.() ?? []) {
           applyWorkspacePermissionPreset(scoped, config, liveAgent.session ?? liveAgent)
+          watchAgentStreams(liveAgent, channelRuntime)
         }
       } catch { /* best effort */ }
       const offSessionEvent = scoped.on?.('session/event', (session, event) => {
+        if (event?.type === 'turn/start') watchAgentStreams(scoped.agents?.get?.(session?.id), channelRuntime)
         observeSessionEvent(scoped, config, session, event)
-      })
-      const offAssistantStream = scoped.on?.('agent/assistant-stream', (payload) => {
-        observeAssistantStream(scoped, config, payload)
       })
 
       // Periodically hand back an idle plugin-owned agent; the app re-resumes
@@ -1421,8 +1849,9 @@ function startInbound(ctx, config) {
         disposed = true
         clearInterval(releaseTimer)
         try { offSessionEvent?.() } catch { /* ignore */ }
-        try { offAssistantStream?.() } catch { /* ignore */ }
         try { connectionCleanup() } catch { /* ignore */ }
+        disposeAgentStreams()
+        channelRuntime = undefined
         setInboundState(config, { ready: false, transport: 'websocket', error: 'closed' })
         const handle = ownedHandle
         ownedHandle = undefined
