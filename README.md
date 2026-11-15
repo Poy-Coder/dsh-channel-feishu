@@ -211,6 +211,20 @@ secret 留在 profile patch 之外；文件权限依赖用户目录本身。
 
 已有会话若标题仍是占位词，下一条消息到达时会被换成那一条的原话。
 
+### 思考过程与消息反馈
+
+- **原生思考过程（CoT）**：每轮开始 `POST /open-apis/im/v1/message_cot` 建一条独立的"思考过程"消息，推理增量走 `REASONING_MESSAGE_*`、工具调用走 `TOOL_CALL_START/ARGS/END/RESULT`，回合结束 `RUN_FINISHED`（出错则 `RUN_ERROR`）。飞书按它自己 agent 的样式渲染，所以工具调用有图标和标题。
+- **消息反应**：收到消息立即在你那条消息上加 `THINKING` 表情，回合结束移除，手机端一眼能看出"在处理"。
+- **卡片版式**：无标题栏、`width_mode: fill` 撑满、正文与灰色页脚之间有分隔线；页脚从"流式输出中"变成"完成"。
+
+对应开关（默认全开）：
+
+```yaml
+thinking: true          # 显示思考过程
+thinkingHidden: false   # 回合结束后折叠思考过程
+reactions: true         # 加/移除 THINKING 反应
+```
+
 ### 斜杠命令（在飞书里直接发，不消耗回合）
 
 | 命令 | 作用 |
