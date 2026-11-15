@@ -1090,6 +1090,152 @@ async function switchToNewSession(ctx, config, { chatId, senderId, firstMessage 
   }
 }
 
+// ---------------------------------------------------------------------------
+// Slash commands
+//
+// Control phrases are handled here and never reach the model: they must not
+// spend a turn, pollute the conversation, or be mistaken for a task.
+// ---------------------------------------------------------------------------
+
+const HELP_TEXT = [
+  '可用命令：',
+  '/help — 这条说明',
+  '/status — 当前会话、工作区、权限与入站状态',
+  '/new [内容] — 开一段新会话（带内容则作为第一条消息）',
+  '/rename <标题> — 给当前会话改名',
+  '/stop — 中断进行中的回合',
+].join('\n')
+
+/** Parse `/name args`; null when the text is not a command. */
+export function parseSlashCommand(text) {
+  const trimmed = String(text ?? '').trim()
+  if (!trimmed.startsWith('/')) return null
+  const body = trimmed.slice(1)
+  if (!body.trim()) return { name: '', args: '', raw: trimmed }
+  const match = /^([a-zA-Z][\w-]*)(?:\s+([\s\S]*))?$/.exec(body)
+  if (!match) return { name: '', args: body.trim(), raw: trimmed }
+  return { name: match[1].toLowerCase(), args: (match[2] ?? '').trim(), raw: trimmed }
+}
+
+/** Interrupt the running turn of the channel's session, if any. */
+export async function stopTurn(ctx, config) {
+  const sessionId = currentSessionId(config)
+  if (!sessionId) return { text: '当前没有会话可停止。', reason: 'no-session' }
+  const agent = ctx?.agents?.get?.(sessionId)
+  if (!agent) return { text: '当前会话没有在运行。', reason: 'no-agent' }
+  if (agent.status !== 'running') return { text: '当前没有进行中的回合。', reason: 'idle' }
+  if (typeof agent.cancel !== 'function') return { text: '这个宿主不支持中断当前回合。', reason: 'unsupported' }
+  agent.cancel({ kind: 'user' })
+  return { text: '已请求中断当前回合。', reason: 'cancelled' }
+}
+
+/** Human-readable channel state for `/status`. */
+export async function statusText(ctx, config, chatId) {
+  const settings = await provider().settingsAsync()
+  const sessionId = currentSessionId(config)
+  const inbound = inboundSnapshot()
+  const agent = sessionId ? ctx?.agents?.get?.(sessionId) : undefined
+  let title = ''
+  try {
+    const snapshot = ctx?.get?.('sessionTitle')?.get?.(agent?.session)
+    title = String(snapshot?.title ?? '')
+  } catch { /* title is optional */ }
+  const preset = config.applyPermissionPreset === false
+    ? '(按会话自身策略)'
+    : String(config.permissionPreset ?? 'danger-full-access')
+  return [
+    `会话：${sessionId || '(未配置)'}`,
+    ...(title ? [`标题：${title}`] : []),
+    `运行：${agent ? (agent.status === 'running' ? '回合进行中' : '空闲') : '未激活'}`,
+    `工作区：${workspacePathFor(config)}`,
+    `权限：${preset}`,
+    `入站：${inbound.ready ? '已就绪' : `未就绪${inbound.error ? `（${inbound.error}）` : ''}`}`,
+    `目标群：${chatId || settings.defaultChatId || '(无)'}`,
+    `提供方：${provider().id}`,
+  ].join('\n')
+}
+
+/**
+ * Handle one control phrase. Returns true when it was consumed here, so the
+ * caller must not deliver the text to the agent.
+ */
+export async function handleSlashCommand(ctx, config, { name, args, chatId, senderId }) {
+  const log = (result, extra = {}) => logInbound(config, {
+    event: 'slash', command: name || '(empty)', result, senderId, chatId, ...extra,
+  })
+  const reply = async (text) => {
+    try {
+      await sendChannelText(config, chatId, text)
+      return true
+    } catch (error) {
+      warnTo(ctx, `slash reply failed: ${errorText(error)}`)
+      log('reply-failed', { reason: errorText(error) })
+      return false
+    }
+  }
+
+  if (!name) {
+    await reply(`未识别的命令。\n\n${HELP_TEXT}`)
+    log('unknown')
+    return true
+  }
+
+  switch (name) {
+    case 'help':
+    case '?':
+      await reply(HELP_TEXT)
+      log('help')
+      return true
+
+    case 'status':
+      await reply(await statusText(ctx, config, chatId))
+      log('status')
+      return true
+
+    case 'stop': {
+      const result = await stopTurn(ctx, config)
+      await reply(result.text)
+      log('stop', { reason: result.reason })
+      return true
+    }
+
+    case 'new':
+      await switchToNewSession(ctx, config, { chatId, senderId, firstMessage: args })
+      log('new', { firstMessage: args ? 'yes' : 'no' })
+      return true
+
+    case 'rename': {
+      const title = args.trim()
+      if (!title) {
+        await reply('用法：/rename 新的标题')
+        log('rename', { reason: 'missing-title' })
+        return true
+      }
+      const agent = ctx?.agents?.get?.(currentSessionId(config))
+      const titles = typeof ctx?.get === 'function' ? ctx.get('sessionTitle') : undefined
+      if (!agent || typeof titles?.rename !== 'function') {
+        await reply('当前会话未激活，或这个宿主不支持改名。')
+        log('rename', { reason: 'unsupported' })
+        return true
+      }
+      try {
+        const snapshot = titles.rename(agent.session, title)
+        await reply(`已改名为「${snapshot?.title ?? title}」。`)
+        log('rename', { result2: 'ok' })
+      } catch (error) {
+        await reply(`改名失败：${errorText(error)}`)
+        log('rename', { reason: errorText(error) })
+      }
+      return true
+    }
+
+    default:
+      await reply(`未识别的命令 /${name}。\n\n${HELP_TEXT}`)
+      log('unknown')
+      return true
+  }
+}
+
 export async function handleInboundEvent(ctx, config, data, seen) {
   const log = (record) => logInbound(config, record)
   // The provider decides what the event means (text, rich text, image, ignored).
@@ -1149,16 +1295,11 @@ export async function handleInboundEvent(ctx, config, data, seen) {
     return
   }
 
-  // `/new` starts a fresh conversation and switches the channel to it:
-  //   `/new`            -> create the session and confirm on Feishu
-  //   `/new <message>`  -> create the session and deliver <message> as its first prompt
-  const newSession = /^\/new(?:\s+([\s\S]*))?$/i.exec(text.trim())
-  if (newSession) {
-    await switchToNewSession(ctx, config, {
-      chatId,
-      senderId,
-      firstMessage: (newSession[1] ?? '').trim(),
-    })
+  // Control phrases are consumed here, never delivered to the model.
+  // `/new` still starts a fresh conversation; `/help` lists the rest.
+  const command = parseSlashCommand(text)
+  if (command) {
+    await handleSlashCommand(ctx, config, { ...command, chatId, senderId })
     return
   }
 

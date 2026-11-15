@@ -58,16 +58,16 @@ sidecar（`feishu-channel-state.json` 的 `chats`，以及进程内的 chat memo
 
 ## 安装
 
-从仓库直接装（DSH 会读取仓库根的 `cordis.patch.yml`）：
+从仓库直接装（DSH 读取仓库根的 `cordis.patch.yml`）：
 
 ```bash
-dsh plugin add Poy-Coder/dsh-channel-feishu
+dsh plugin add dsh-channel-feishu
 ```
 
-或用 Release 里的压缩包（`v0.6.0` 起附带）：
+或用 Release 里的压缩包（`v0.7.0` 起附带）：
 
 ```bash
-dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.6.0/dsh-channel-feishu-0.6.0.tgz
+dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.7.0/dsh-channel-feishu-0.7.0.tgz
 ```
 
 依赖必须用扁平结构装（非 ASCII 目录下 pnpm 的软链会把路径写坏）：
@@ -75,6 +75,15 @@ dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download
 ```bash
 pnpm install --node-linker=hoisted
 ```
+
+## 权限（飞书后台）
+
+- `im:message`、`im:message:send_as_bot`：发消息
+- `im:message.p2p_msg:readonly`（私聊）或 `im:message.group_at_msg:readonly`（群 @）：收消息
+- `cardkit:card:write`：流式卡片；缺这条 `streamingCards` 会自动降级为纯文本
+- 事件订阅方式选 **使用长连接接收事件**，订阅 `im.message.receive_v1`，改完要**发布版本**才生效
+
+安装前的 profile 清单与 patch 备份在 `D:\dsh\工作区\_tools\desktop-profile-*.bak`。
 
 ## 一次性准备：创建飞书自建应用（约 5 分钟）
 
@@ -202,6 +211,18 @@ secret 留在 profile patch 之外；文件权限依赖用户目录本身。
 3. 有了标题再 `attachSession()` 到 `workspacePath`；失败时也照样挂载，只是标题为空。
 
 已有会话若标题仍是占位词，下一条消息到达时会被换成那一条的原话。
+
+### 斜杠命令（在飞书里直接发，不消耗回合）
+
+| 命令 | 作用 |
+|---|---|
+| `/help` | 命令清单 |
+| `/status` | 当前会话、标题、运行状态、工作区、权限、入站与目标群 |
+| `/new [内容]` | 开一段新会话；带内容则作为第一条消息 |
+| `/rename <标题>` | 给当前会话改名（钉住标题，模型不会再改） |
+| `/stop` | 中断进行中的回合（`agent.cancel({kind:'user'})`） |
+
+命令在 `handleInboundEvent` 里被拦截：**既不会投递给模型，也不会写进会话记录**，只回一条飞书消息并把 `event=slash` 记进诊断日志。未识别的 `/xxx` 同样拦截并回帮助，避免误当任务执行。
 
 ### 入站工作方式
 
