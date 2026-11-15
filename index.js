@@ -19,9 +19,9 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { appendFileSync, readFileSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { dirname, join, parse } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import z from '@deepseek-ai/schemastery'
@@ -1052,15 +1052,39 @@ const PACKAGE_DIR = dirname(fileURLToPath(import.meta.url))
 /**
  * Dedicated workspace for channel-created sessions, so they show up under their
  * own group in the GUI's workspace list instead of polluting a personal one.
- * Under the user's home (an app update replaces the install tree); override with
- * `workspacePath` in the row config.
  */
-const DEFAULT_WORKSPACE_PATH = join(homedir(), 'dsh-feishu')
 const DEFAULT_WORKSPACE_TITLE = '飞书'
 
-/** Directory a Feishu-created session uses as cwd. */
+/**
+ * Default workspace directory.
+ *
+ * Never silently lands on the Windows system drive: prefer the drive the app is
+ * installed on, then any other fixed drive, and only fall back to the user's home
+ * when no non-system drive exists. `workspacePath` in the row config always wins.
+ */
+function defaultWorkspacePath() {
+  const home = homedir()
+  if (process.platform !== 'win32') return join(home, 'dsh-feishu')
+  const systemDrive = String(process.env.SystemDrive ?? 'C:').trim().toLowerCase()
+  const installDrive = (() => {
+    const dir = String(process.env.DSH_INSTALL_DIR ?? '').trim()
+    if (!dir) return ''
+    try { return parse(dir).root } catch { return '' }
+  })()
+  const candidates = [installDrive, ...'DEFGHIJKLMNOPQRSTUVWXYZ'.split('').map((letter) => `${letter}:\\`)]
+  for (const root of candidates) {
+    if (!root) continue
+    if (root.toLowerCase() === `${systemDrive}\\`) continue
+    try {
+      if (existsSync(root)) return join(root, 'dsh-feishu')
+    } catch { /* unreadable drive, try the next one */ }
+  }
+  return join(home, 'dsh-feishu')
+}
+
+/** Directory a channel-created session uses as cwd. */
 export function workspacePathFor(config) {
-  return String(config?.workspacePath ?? '').trim() || DEFAULT_WORKSPACE_PATH
+  return String(config?.workspacePath ?? '').trim() || defaultWorkspacePath()
 }
 
 /** Directory used when `sessionMode` has to create a session. */
@@ -1077,7 +1101,7 @@ export function createCwdFor(config) {
  * best-effort — a host without `workspaceRegistry` (or an older/newer DSH whose
  * service shape moved) must not break message delivery.
  */
-async function attachToFeishuWorkspace(ctx, config, sessionId) {
+export async function attachToFeishuWorkspace(ctx, config, sessionId) {
   try {
     const registry = typeof ctx.get === 'function' ? ctx.get('workspaceRegistry') : undefined
     if (!registry || typeof registry.resolveByPath !== 'function') {
@@ -1085,7 +1109,19 @@ async function attachToFeishuWorkspace(ctx, config, sessionId) {
       return false
     }
     const path = workspacePathFor(config)
+    // The registry records the path, but on a fresh machine the directory may not
+    // exist yet — DSH refuses a session whose cwd cannot resolve.
+    try {
+      mkdirSync(path, { recursive: true })
+    } catch { /* best effort; the attach below reports the real problem */ }
     let workspace = await registry.resolveByPath(path)
+    // `create()` reuses a workspace for the same canonical path, but a different
+    // spelling (trailing separator, letter case) can still resolve to a second
+    // entry on hosts that compare strings. Scan once before creating.
+    if (!workspace && typeof registry.list === 'function') {
+      const wanted = normalizePath(path)
+      workspace = (registry.list() ?? []).find((entry) => normalizePath(entry?.path) === wanted)
+    }
     if (!workspace) {
       workspace = await registry.create(path, DEFAULT_WORKSPACE_TITLE)
       logInbound(config, { event: 'workspace', result: 'created', path })

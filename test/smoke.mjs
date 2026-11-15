@@ -6,7 +6,7 @@
  * Usage: node test/smoke.mjs
  */
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir, homedir } from 'node:os'
 import { join } from 'node:path'
 
@@ -124,10 +124,13 @@ assert.equal(
   '你好 在吗',
 )
 
-// 7c. Sessions created by the channel land in the dedicated Feishu workspace.
-assert.equal(workspacePathFor({}), join(homedir(), 'dsh-feishu'))
+// 7c. Sessions created by the channel land in a dedicated workspace directory,
+// never silently on the system drive.
+const defaultWorkspace = workspacePathFor({})
+assert.ok(defaultWorkspace.endsWith('dsh-feishu'), `unexpected default: ${defaultWorkspace}`)
+assert.ok(process.platform !== 'win32' || !/^c:/i.test(defaultWorkspace), 'default must stay off the system drive')
 assert.equal(workspacePathFor({ workspacePath: '  D:\\other  ' }), 'D:\\other')
-assert.equal(createCwdFor({}), join(homedir(), 'dsh-feishu'))
+assert.equal(createCwdFor({}), defaultWorkspace)
 assert.equal(createCwdFor({ cwd: 'D:\\explicit' }), 'D:\\explicit')
 assert.equal(createCwdFor({ cwd: '', workspacePath: 'D:\\ws' }), 'D:\\ws')
 
@@ -778,6 +781,36 @@ await cotProvider.removeReaction({ messageId: 'om_1', reactionId: 'rx_1' })
 assert.ok(cotCalls.some((call) => call.url.includes('/message_cot')), 'the CoT endpoint must be used')
 assert.ok(cotCalls.some((call) => call.url.includes('/reactions')), 'the reaction endpoint must be used')
 globalThis.fetch = realFetch
+
+// 18. Workspace auto-provisioning: a fresh machine gets the directory, the
+// workspace entry (titled 飞书) and the session attached to it.
+const { attachToFeishuWorkspace } = await import('../index.js')
+const wsRoot = join(mkdtempSync(join(tmpdir(), 'feishu-ws-')), 'dsh-feishu')
+const createdWorkspaces = []
+const attachedSessions = []
+const wsRegistry = {
+  resolveByPath: async (path) => createdWorkspaces.find((entry) => entry.path === path),
+  create: async (path, title) => {
+    const entry = { path, title, attachSession: async (id) => { attachedSessions.push(id) } }
+    createdWorkspaces.push(entry)
+    return entry
+  },
+}
+const wsCtx2 = {
+  logger: { warn: () => {} },
+  get: (name) => (name === 'workspaceRegistry' ? wsRegistry : undefined),
+}
+const attached = await attachToFeishuWorkspace(wsCtx2, { workspacePath: wsRoot, logFile }, 'session-ws')
+assert.equal(attached, true)
+assert.equal(existsSync(wsRoot), true, 'the workspace directory must exist on disk')
+assert.deepEqual(createdWorkspaces.map((entry) => entry.title), ['飞书'])
+assert.deepEqual(attachedSessions, ['session-ws'])
+// A second session reuses the workspace instead of creating another one.
+await attachToFeishuWorkspace(wsCtx2, { workspacePath: wsRoot, logFile }, 'session-ws2')
+assert.equal(createdWorkspaces.length, 1, 'the workspace must be reused by path')
+assert.deepEqual(attachedSessions, ['session-ws', 'session-ws2'])
+// A host without the registry must not break delivery.
+assert.equal(await attachToFeishuWorkspace({ logger: { warn: () => {} }, get: () => undefined }, { logFile }, 'x'), false)
 
 console.log('smoke ok: 3 tools registered, schemas valid, credentials precedence, '
   + 'inbound helpers, error paths, identified-message contract, /new switching, '

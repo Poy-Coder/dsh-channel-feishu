@@ -64,10 +64,10 @@ sidecar（`feishu-channel-state.json` 的 `chats`，以及进程内的 chat memo
 dsh plugin add dsh-channel-feishu
 ```
 
-或用 Release 里的压缩包（`v0.7.1` 起附带）：
+或用 Release 里的压缩包（`v0.7.2` 起附带）：
 
 ```bash
-dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.7.1/dsh-channel-feishu-0.7.1.tgz
+dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.7.2/dsh-channel-feishu-0.7.2.tgz
 ```
 
 依赖必须用扁平结构装（非 ASCII 目录下 pnpm 的软链会把路径写坏）：
