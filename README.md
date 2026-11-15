@@ -76,6 +76,27 @@ dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download
 pnpm install --node-linker=hoisted
 ```
 
+### 启用入站（默认关闭）
+
+新装的 bundle 只注册工具，`inboundEnabled` 默认是 `false`：不打开长连接、不接收飞书消息。要让它成为双向通道，在 profile 的 `cordis.patch.yml` 里覆盖（或用设置页表单）：
+
+```yaml
+- id: feishu-channel
+  name: dsh-channel-feishu
+  config:
+    inboundEnabled: true
+    sessionMode: create
+    # 首次收消息时按此 id 建会话
+    sessionId: session-<uuid>
+    # 只允许你自己；留空表示任何人
+    allowedUsers: ["ou_..."]
+    # 省略则用 %USERPROFILE%\dsh-feishu
+    workspacePath: ""
+    permissionPreset: danger-full-access
+```
+
+入站是显式选择，因为它会让飞书里能发消息的人驱动本机 agent，并把该工作区的会话切到完全权限。
+
 ## 权限（飞书后台）
 
 - `im:message`、`im:message:send_as_bot`：发消息
