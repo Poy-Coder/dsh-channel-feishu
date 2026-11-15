@@ -17,7 +17,7 @@
         sessionMode: resume
         # Sender allowlist (open_id); empty accepts anyone.
         allowedUsers: []
-        # Workspace that owns channel sessions; '' uses D:\dsh\feishu.
+        # Workspace that owns channel sessions; '' uses <home>/dsh-feishu.
         workspacePath: ''
         # Answer delivery: stream into a card, and deliver each turn's answer
         # back to the originating chat without the model calling a tool.

@@ -303,6 +303,13 @@ function cardJson(text, summary) {
     schema: '2.0',
     config: {
       streaming_mode: true,
+      // The Feishu client animates the text itself, so cumulative PATCHes read
+      // as continuous typing instead of one jump per write.
+      streaming_config: {
+        print_frequency_ms: { default: 40, android: 40, ios: 40, pc: 40 },
+        print_step: { default: 1, android: 1, ios: 1, pc: 1 },
+        print_strategy: 'fast',
+      },
       update_multi: true,
       summary: { content: summary },
     },

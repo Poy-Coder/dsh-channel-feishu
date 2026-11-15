@@ -7,7 +7,7 @@
  */
 import assert from 'node:assert/strict'
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { tmpdir, homedir } from 'node:os'
 import { join } from 'node:path'
 
 const emptyHome = mkdtempSync(join(tmpdir(), 'feishu-empty-'))
@@ -125,9 +125,9 @@ assert.equal(
 )
 
 // 7c. Sessions created by the channel land in the dedicated Feishu workspace.
-assert.equal(workspacePathFor({}), 'D:\\dsh\\feishu')
+assert.equal(workspacePathFor({}), join(homedir(), 'dsh-feishu'))
 assert.equal(workspacePathFor({ workspacePath: '  D:\\other  ' }), 'D:\\other')
-assert.equal(createCwdFor({}), 'D:\\dsh\\feishu')
+assert.equal(createCwdFor({}), join(homedir(), 'dsh-feishu'))
 assert.equal(createCwdFor({ cwd: 'D:\\explicit' }), 'D:\\explicit')
 assert.equal(createCwdFor({ cwd: '', workspacePath: 'D:\\ws' }), 'D:\\ws')
 
@@ -401,8 +401,14 @@ await handleInboundEvent(
 assert.equal(createdIds.length, 1, '/new must create exactly one session')
 assert.match(createdIds[0], /^session-[0-9a-f-]{36}$/, '/new session ids must be DSH-shaped')
 assert.equal(deliveredNew.length, 0, 'a bare /new must not deliver a prompt')
-assert.equal(lastLog().event, 'session')
-assert.equal(lastLog().result, 'switched')
+assert.ok(
+  readLog().some((line) => line.event === 'session' && line.result === 'switched'),
+  'the switch must be logged as a session event',
+)
+assert.ok(
+  readLog().some((line) => line.event === 'slash' && line.command === 'new'),
+  'the command itself must be logged as a slash event',
+)
 assert.equal(JSON.parse(readFileSync(stateFile, 'utf8')).sessionId, createdIds[0], 'the switch must be persisted')
 
 // 9h. `/new <message>` delivers that message as the new conversation's first prompt.
@@ -576,8 +582,8 @@ const wsCtx = {
     ? { current: () => 'workspace-write', set: (session, preset) => wsCalls.push([session.id, preset]) }
     : undefined),
 }
-const wsConfig = { sessionId: 'session-other', workspacePath: 'D:\\dsh\\feishu', permissionPreset: 'danger-full-access' }
-observeSessionEvent(wsCtx, wsConfig, { id: 'session-gui', header: { cwd: 'D:\\dsh\\feishu' } }, { type: 'turn/start', data: { turn: 1 } })
+const wsConfig = { sessionId: 'session-other', workspacePath: 'C:\\tmp\\feishu-ws', permissionPreset: 'danger-full-access' }
+observeSessionEvent(wsCtx, wsConfig, { id: 'session-gui', header: { cwd: 'C:\\tmp\\feishu-ws' } }, { type: 'turn/start', data: { turn: 1 } })
 assert.deepEqual(wsCalls, [['session-gui', 'danger-full-access']])
 wsCalls.length = 0
 observeSessionEvent(wsCtx, wsConfig, { id: 'session-elsewhere', header: { cwd: 'D:\\dsh\\work' } }, { type: 'turn/start', data: { turn: 1 } })
@@ -708,6 +714,34 @@ assert.equal(explicitWins.appId, 'row-id', 'row config outranks the credentials 
 const brokenStore = { resolve: async () => { throw new Error('store down') } }
 const tolerant = await resolveSettingsWithCredentials({ appSecret: 'row-secret' }, brokenStore)
 assert.equal(tolerant.appId, '', 'a failing store must not break settings resolution')
+
+// 16. Slash commands: parsed, consumed before the model, and able to stop a turn.
+const { parseSlashCommand, stopTurn, statusText } = await import('../index.js')
+assert.equal(parseSlashCommand('普通消息'), null)
+assert.equal(parseSlashCommand('/').name, '', 'a bare slash is an empty command, not a message')
+assert.deepEqual(parseSlashCommand('/help'), { name: 'help', args: '', raw: '/help' })
+assert.deepEqual(parseSlashCommand('/new 帮我看下 A'), { name: 'new', args: '帮我看下 A', raw: '/new 帮我看下 A' })
+assert.equal(parseSlashCommand('/rename   两个空格  ').args, '两个空格')
+assert.equal(parseSlashCommand('/stop').name, 'stop')
+assert.equal(parseSlashCommand(' /status ').name, 'status')
+
+const cancelled = []
+const stopCtx = (agent) => ({ agents: { get: () => agent } })
+assert.equal((await stopTurn(stopCtx(undefined), { sessionId: 's1' })).reason, 'no-agent')
+assert.equal((await stopTurn(stopCtx({ status: 'idle' }), { sessionId: 's1' })).reason, 'idle')
+assert.equal((await stopTurn(stopCtx({ status: 'running', cancel: (cause) => cancelled.push(cause) }), { sessionId: 's1' })).reason, 'cancelled')
+assert.deepEqual(cancelled, [{ kind: 'user' }], 'stop must cancel with the user cause')
+assert.equal((await stopTurn(stopCtx({ status: 'running' }), { sessionId: '' })).reason, 'no-session')
+
+const statusReport = await statusText(
+  { agents: { get: () => undefined }, get: () => undefined },
+  { sessionId: 'session-x', workspacePath: 'C:\\tmp\\feishu-ws' },
+  'oc_x',
+)
+assert.match(statusReport, /会话：session-x/)
+assert.match(statusReport, /工作区：C:\\tmp\\feishu-ws/)
+assert.match(statusReport, /权限：danger-full-access/)
+assert.match(statusReport, /目标群：oc_x/)
 
 console.log('smoke ok: 3 tools registered, schemas valid, credentials precedence, '
   + 'inbound helpers, error paths, identified-message contract, /new switching, '

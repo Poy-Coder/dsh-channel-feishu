@@ -83,7 +83,6 @@ pnpm install --node-linker=hoisted
 - `cardkit:card:write`：流式卡片；缺这条 `streamingCards` 会自动降级为纯文本
 - 事件订阅方式选 **使用长连接接收事件**，订阅 `im.message.receive_v1`，改完要**发布版本**才生效
 
-安装前的 profile 清单与 patch 备份在 `D:\dsh\工作区\_tools\desktop-profile-*.bak`。
 
 ## 一次性准备：创建飞书自建应用（约 5 分钟）
 
@@ -103,16 +102,16 @@ pnpm install --node-linker=hoisted
 
 | 想要 | 接口 | 需要的权限 | 本应用现状 |
 |---|---|---|---|
-| 应用可见范围内所有用户 open_id | `GET /open-apis/contact/v3/scopes` | 无需额外权限 | ✅ 可用，返回 `ou_9e94dc6112b3db9697df1e7c51cb91ce`（= 应用创建者/你本人） |
+| 应用可见范围内所有用户 open_id | `GET /open-apis/contact/v3/scopes` | 无需额外权限 | ✅ 可用，返回 `ou_xxxxxxxxxxxx`（= 应用创建者/你本人） |
 | 邮箱或手机号 → open_id | `POST /open-apis/contact/v3/users/batch_get_id?user_id_type=open_id`，body `{"emails":["..."]}` | `contact:user.id:readonly` | ⚠️ 未开通（报 99991672，按返回里的链接申请即可） |
 | 机器人所在群列表 → `oc_...` | `GET /open-apis/im/v1/chats` | `im:chat:read` | ✅ 可用（当前为空：机器人还没进群） |
 | 发送者是谁（事件回调） | 订阅 `im.message.receive_v1`，读事件里的 `sender.sender_id.open_id` | `im:message.p2p_msg:readonly` | ✅ 已具备权限；回调已是 **websocket 长连接**模式 |
 | user_id（企业内标识） | `contact:user.employee_id:readonly`（user token）或管理后台导出 | 按接口 | 未开通；机器人发送用 open_id 就够 |
 
-本机实测结论（应用 `知微` / `cli_aa8f9f976e389ccc`）：
+本机实测结论（应用 `示例应用` / `cli_xxxxxxxxxxxx`）：
 
-- `contact/v3/scopes` → `ou_9e94dc6112b3db9697df1e7c51cb91ce`
-- 用它发消息成功，返回该单聊的 `chat_id` = `oc_b83326e43b4f4981cfe75b654efd5edc`
+- `contact/v3/scopes` → `ou_xxxxxxxxxxxx`
+- 用它发消息成功，返回该单聊的 `chat_id` = `oc_xxxxxxxxxxxx`
   → 已写入 row config 的 `defaultChatId`，`feishu_send_message` 不带参数即可发到你的飞书单聊。
 
 也可以不配默认值，每次调用显式传 `receiveId`：`oc_...` 自动按 `chat_id`，`ou_...` 按 `open_id`，
@@ -172,12 +171,12 @@ secret 留在 profile patch 之外；文件权限依赖用户目录本身。
     sessionMode: resume               # resume（默认）| create | off
     streamingCards: true              # 出站用 CardKit 流式卡片（默认 true）
     preset: cordis                    # 可选：固定 agent preset；省略则用会话里存的那个
-    cwd: 'D:\dsh\工作区'              # 仅在 create/新建会话时使用；省略则用插件所在工作区
+    cwd: '<workspace>'              # 仅在 create/新建会话时使用；省略则用插件所在工作区
     idleReleaseMinutes: 30            # 空闲多少分钟后交还 agent；0 = 保活到插件卸载
     logFile: 'C:\Users\…\feishu-inbound.log'  # 省略则写 <DSH_HOME>/feishu-inbound.log
     stateFile: 'C:\Users\…\feishu-channel-state.json'  # /new 切换的会话 + 会话→飞书 chat 映射
     notifyOnNew: true                 # /new 不带内容时，是否在飞书回一句确认
-    workspacePath: 'D:\dsh\feishu'     # 飞书会话的专用工作区目录（省略则用该默认值）
+    workspacePath: '%USERPROFILE%\dsh-feishu'     # 飞书会话的专用工作区目录（省略则用该默认值）
     inboundFilesDir: 'C:\Users\…\feishu-inbound-files'  # 入站图片落盘目录（省略则同目录）
 ```
 
@@ -190,7 +189,7 @@ secret 留在 profile patch 之外；文件权限依赖用户目录本身。
     permissionPreset: 'danger-full-access'   # 默认值；applyPermissionPreset: false 可关闭
 ```
 
-生效范围是 `cwd` 等于 `workspacePath`（默认 `D:\dsh\feishu`）的**所有**会话，包括：
+生效范围是 `cwd` 等于 `workspacePath`（默认 `%USERPROFILE%\dsh-feishu`）的**所有**会话，包括：
 
 - 入站消息激活/新建的会话（`resume` / `create` / `/new` 三条路径都会调）；
 - 你在 GUI 里于「飞书」工作区手动新建的会话（`turn/start` 时套用）。
@@ -240,7 +239,7 @@ secret 留在 profile patch 之外；文件权限依赖用户目录本身。
    - 否则 `ctx.agents.resume({ resumeSessionId: sessionId })` 激活上次对话
      （DSH 自带的无界面 ACP 客户端走的就是这条）；
    - 再失败且 `sessionMode: create` → `ctx.agents.create()` 新建（`cwd` 用 `cwd` 配置值，
-     否则用 `workspacePath`，默认 `D:\dsh\feishu`）。
+     否则用 `workspacePath`，默认 `%USERPROFILE%\dsh-feishu`）。
    注意：默认**续接原会话**；`create` 只是"会话不存在时"的兜底，不会主动新开一段对话。
 4. **工作区归属**：插件新建的会话在建完立刻登记到 `workspacePath` 指向的「飞书」工作区
    （`workspaceRegistry.resolveByPath` → 没有就 `create` → `attachSession`），所以 GUI 的工作区

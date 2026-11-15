@@ -20,6 +20,7 @@
 
 import { randomUUID } from 'node:crypto'
 import { appendFileSync, readFileSync, writeFileSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -151,7 +152,7 @@ function destination(settings, args) {
 //   - finalize: `turn/end` closes the card (or falls back to a text message)
 // ---------------------------------------------------------------------------
 
-const CARD_FLUSH_MS = 120
+const CARD_FLUSH_MS = 60
 const MAX_REPLY_CHARS = 15_000
 const CHAT_MEMORY = new Map()
 const turns = new Map()
@@ -204,7 +205,7 @@ function turnRecord(sessionId, turn) {
   record = {
     key, sessionId, turn,
     committed: '', stepStream: '', stepBlocks: new Set(),
-    card: undefined, cardFailed: false, sentByTool: false, lastCardText: '',
+    card: undefined, cardFailed: false, sentByTool: false, lastCardText: '', updates: 0,
     timer: undefined, lastSentAt: 0,
   }
   turns.set(key, record)
@@ -291,6 +292,7 @@ async function flushCard(record, ctx, config) {
     card.sequence += 1
     await provider().card.update({ cardId: card.cardId, content: text, sequence: card.sequence })
     record.lastCardText = text
+    record.updates = (record.updates ?? 0) + 1
     record.lastSentAt = Date.now()
   } catch (error) {
     record.cardFailed = true
@@ -348,6 +350,7 @@ export async function finalizeTurn(ctx, config, sessionId, turn, reason) {
         })
         logInbound(config, {
           event: 'card', result: 'closed', sessionId, turn, cardId: card.cardId, chars: text.length,
+          updates: record.updates ?? 0,
         })
         return
       } catch (error) {
@@ -631,12 +634,12 @@ function warnTo(ctx, message) {
 
 const PACKAGE_DIR = dirname(fileURLToPath(import.meta.url))
 /**
- * Dedicated workspace for Feishu-created sessions, so they show up under their
+ * Dedicated workspace for channel-created sessions, so they show up under their
  * own group in the GUI's workspace list instead of polluting a personal one.
- * Deliberately outside the install directory (an app update replaces that whole
- * tree). Override with `workspacePath` in the row config.
+ * Under the user's home (an app update replaces the install tree); override with
+ * `workspacePath` in the row config.
  */
-const DEFAULT_WORKSPACE_PATH = 'D:\\dsh\\feishu'
+const DEFAULT_WORKSPACE_PATH = join(homedir(), 'dsh-feishu')
 const DEFAULT_WORKSPACE_TITLE = '飞书'
 
 /** Directory a Feishu-created session uses as cwd. */
