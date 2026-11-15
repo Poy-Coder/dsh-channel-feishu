@@ -72,16 +72,17 @@ sidecar（`feishu-channel-state.json` 的 `chats`，以及进程内的 chat memo
 
 ## 安装
 
-从仓库直接装（DSH 读取仓库根的 `cordis.patch.yml`）：
+npm（<https://www.npmjs.com/package/dsh-channel-feishu>）：
 
 ```bash
 dsh plugin add dsh-channel-feishu
 ```
 
-或用 Release 里的压缩包（`v0.8.1` 起附带）：
+或从 GitHub 仓库/Release（内容一致）：
 
 ```bash
-dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.8.1/dsh-channel-feishu-0.8.1.tgz
+dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu
+dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.8.2/dsh-channel-feishu-0.8.2.tgz
 ```
 
 依赖必须用扁平结构装（非 ASCII 目录下 pnpm 的软链会把路径写坏）：
