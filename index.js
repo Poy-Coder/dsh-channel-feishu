@@ -1175,8 +1175,9 @@ export async function handleSlashCommand(ctx, config, { name, args, chatId, send
   }
 
   if (!name) {
-    await reply(`未识别的命令。\n\n${HELP_TEXT}`)
-    log('unknown')
+    // A bare `/` is someone looking for the command list, not a typo.
+    await reply(String(args ?? '').trim() ? `未识别的命令。\n\n${HELP_TEXT}` : HELP_TEXT)
+    log('help')
     return true
   }
 
