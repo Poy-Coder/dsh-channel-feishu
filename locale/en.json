@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Feishu channel",
+    "description": "Connects a Feishu (Lark) chat to a DSH session: messages arrive verbatim, answers stream back as a card, and files can be sent both ways. Set provider, session and allowedUsers in the row config; keep appId/appSecret in the credentials store or ~/.dsh/feishu-channel.json. Needs a self-built app with the bot capability, a long-connection event subscription, and permissions im:message, im:message:send_as_bot, im:message.p2p_msg:readonly (or the group @ variant), cardkit:card:write for streaming cards. Sessions created by the channel land in workspacePath and switch to permissionPreset (default danger-full-access) because nobody is at the GUI to answer approvals. Limits: images up to 10 MB, other files up to 30 MB, one event connection per app. Turning it off unregisters the tools and closes the connection; stored chat memory stays on disk."
+  }
+}

@@ -1,0 +1,48 @@
+{
+  "name": "dsh-channel-feishu",
+  "version": "0.6.0",
+  "type": "module",
+  "description": "Feishu/Lark (飞书) channel for DeepSeek Harness: a chat bound to a DSH session, with streaming cards and attachments.",
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "feishu",
+    "lark",
+    "channel",
+    "im",
+    "plugin"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "icon": "icon.svg",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "files": [
+    "index.js",
+    "providers",
+    "cordis.patch.yml",
+    "README.md",
+    "locale",
+    "docs",
+    "icon.svg",
+    "LICENSE"
+  ],
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.19.0",
+    "@larksuiteoapi/node-sdk": "^1.74.0"
+  },
+  "engines": {
+    "node": ">=20.18.1"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

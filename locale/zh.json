@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "飞书通道",
+    "description": "把飞书（Lark）会话接到一个 DSH 会话：入站消息按原话投递，回答以流式卡片回传，双向都能发附件。在行配置里设置 provider、会话与 allowedUsers；appId/appSecret 放凭据库或 ~/.dsh/feishu-channel.json。需要一个开启机器人能力的自建应用、事件订阅选「使用长连接接收事件」，并开通 im:message、im:message:send_as_bot、im:message.p2p_msg:readonly（群聊用 @ 版本）、流式卡片再加 cardkit:card:write。通道创建的会话落在 workspacePath 工作区，并自动切到 permissionPreset（默认 danger-full-access），因为飞书轮次无人值守、没人点授权。限制：图片 ≤ 10 MB，其它文件 ≤ 30 MB，每个应用一条事件连接。关闭插件会注销工具并断开连接，已存的会话与聊天映射仍在磁盘上。",
+    "detail": "docs/DETAIL.zh.md"
+  }
+}
