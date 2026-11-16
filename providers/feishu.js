@@ -588,6 +588,10 @@ export async function downloadMessageFile(base, token, messageId, fileKey, fileN
   const message = event?.message
   const sender = event?.sender
   if (!message || !sender) return null
+  // The SDK dispatcher hands over the event body, not the envelope, so
+  // `header.event_id` is usually absent. `message_id` is stable across
+  // redeliveries and is what dedupe needs to survive a restart.
+  const dedupeKey = String(event?.header?.event_id ?? event?.event_id ?? message.message_id ?? '')
   const messageType = String(message.message_type ?? '')
   const mentions = message.mentions
   let text = ''
@@ -607,7 +611,7 @@ export async function downloadMessageFile(base, token, messageId, fileKey, fileN
     if (file.fileKey) files = [file]
   } else {
     return {
-      dedupeKey: String(event?.header?.event_id ?? ''),
+      dedupeKey,
       chatId: String(message.chat_id ?? ''),
       chatType: String(message.chat_type ?? ''),
       senderId: String(sender.sender_id?.open_id ?? ''),
@@ -620,7 +624,7 @@ export async function downloadMessageFile(base, token, messageId, fileKey, fileN
     }
   }
   return {
-    dedupeKey: String(event?.header?.event_id ?? ''),
+    dedupeKey,
     chatId: String(message.chat_id ?? ''),
     chatType: String(message.chat_type ?? ''),
     senderId: String(sender.sender_id?.open_id ?? ''),

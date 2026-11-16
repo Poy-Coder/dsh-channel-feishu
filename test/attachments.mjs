@@ -39,6 +39,12 @@ const fileEvent = {
 const parsed = parseInboundEvent(fileEvent)
 assert.equal(parsed.unsupported, '')
 assert.equal(parsed.messageId, 'om_1')
+// An envelope carries event_id; the SDK hands over the bare body, so dedupe
+// falls back to message_id — that is what makes a restart redelivery visible.
+assert.equal(parsed.dedupeKey, 'evt_1')
+const envelopeLess = { ...fileEvent }
+delete envelopeLess.header
+assert.equal(parseInboundEvent(envelopeLess).dedupeKey, 'om_1')
 assert.deepEqual(parsed.files, [{ fileKey: 'fk_1', fileName: '季度报告.pdf' }])
 assert.deepEqual(parsed.imageKeys, [])
 
