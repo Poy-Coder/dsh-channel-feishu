@@ -89,6 +89,7 @@ export const Config = z.object({
   appSecret: z.string().default('').description('Optional app secret; prefer the credentials store or credentials file.'),
   defaultChatId: z.string().default('').description('Destination used when a tool call omits receiveId.'),
   logFile: z.string().default('').description('Inbound diagnostics log path.'),
+  readyNotice: z.boolean().default(true).description('Send one "channel ready" message to the default chat after the inbound long connection comes up.'),
   logLevel: z.union([z.const('debug'), z.const('info'), z.const('warn'), z.const('error')])
     .default('info')
     .description('Minimum severity written to the diagnostics log.'),
@@ -1090,6 +1091,33 @@ const sendFileTool = (config) => ({
   },
 })
 
+/**
+ * What the operator (or another agent) should do next, derived from live state.
+ * Installing used to be trial and error; the tool now names the missing step.
+ */
+function nextStepsOf(config, result, inbound) {
+  const steps = []
+  if (!result?.configured) {
+    steps.push(
+      `写凭据：把 appId / appSecret 放进 ${credentialsFilePath()}（UTF-8 无 BOM），`
+      + '或设环境变量 FEISHU_APP_ID / FEISHU_APP_SECRET',
+    )
+  }
+  if (result?.configured && !result?.tokenOk) {
+    steps.push('取 token 失败：核对 appId / appSecret、region（国际版用 lark），确认应用已发布并开通机器人能力')
+  }
+  if (config?.enabled !== false && config?.inboundEnabled !== true) {
+    steps.push('入站未开启：在 profile 的 cordis.patch.yml 给 feishu-channel 行设 inboundEnabled: true，然后重启 DSH')
+  }
+  if (config?.inboundEnabled === true && !inbound?.ready) {
+    steps.push('入站长连接未就绪：确认没有另一个飞书插件用同一个 App 在连接（会互相抢事件），然后重启 DSH')
+  }
+  if (!String(result?.defaultChatId ?? '').trim()) {
+    steps.push('没有默认会话：把 defaultChatId（oc_ 开头）写进凭据文件，或在行 config 里设置')
+  }
+  return steps
+}
+
 const statusTool = (config) => ({
   name: 'feishu_channel_status',
   description:
@@ -1124,13 +1152,18 @@ const statusTool = (config) => ({
         flushRan: { type: 'number' },
         streamShape: { type: 'string' },
         error: { type: 'string' },
+        version: { type: 'string' },
+        nextSteps: { type: 'array', items: { type: 'string' } },
       },
       required: ['configured', 'tokenOk'],
       additionalProperties: true,
     },
     render(_args, value) {
+      const steps = Array.isArray(value?.nextSteps) && value.nextSteps.length > 0
+        ? `\n下一步：\n${value.nextSteps.map((step, index) => `${index + 1}. ${step}`).join('\n')}`
+        : ''
       if (!value?.configured) {
-        return [{ type: 'text', text: `飞书通道未配置。${value?.error ?? ''}`.trim() }]
+        return [{ type: 'text', text: `飞书通道未配置。${value?.error ?? ''}`.trim() + steps }]
       }
       const head = value.tokenOk
         ? '飞书通道已配置，tenant_access_token 获取成功。'
@@ -1154,14 +1187,18 @@ const statusTool = (config) => ({
           + (value.streamShape ? `\n首帧结构=${value.streamShape}` : '')
           + `\n观察：不符=${value.observeMismatch ?? 0} 无帧=${value.observeNoFrame ?? 0}`
           + ` start=${value.observeStart ?? 0} end=${value.observeEnd ?? 0} chunk=${value.observeChunk ?? 0}`
-          + (value.lastObserve ? `\n最近=${value.lastObserve}` : ''),
+          + (value.lastObserve ? `\n最近=${value.lastObserve}` : '')
+          + `\n版本=${value.version || '(unknown)'}`
+          + (Array.isArray(value.nextSteps) && value.nextSteps.length > 0
+            ? `\n下一步：\n${value.nextSteps.map((step, index) => `${index + 1}. ${step}`).join('\n')}`
+            : ''),
       }]
     },
   },
   async execute(_args, exec) {
     const inbound = inboundSnapshot()
     const result = await provider().checkStatus(exec?.signal)
-    return {
+    const state = {
       ...result,
       autoReply: config.autoReply !== false,
       streamingCards: config.streamingCards !== false,
@@ -1189,7 +1226,9 @@ const statusTool = (config) => ({
       observeStart: observeStats.start,
       observeEnd: observeStats.end,
       observeChunk: observeStats.chunk,
+      version: PLUGIN_VERSION,
     }
+    return { ...state, nextSteps: nextStepsOf(config, state, inbound) }
   },
 })
 
@@ -1424,6 +1463,42 @@ export function inboundSnapshot() {
 function setInboundState(config, next) {
   inboundState = { ...inboundState, ...next, at: Date.now() }
   logInbound(config, { event: 'channel', ...next })
+}
+
+/** Version of the running package, shown in the status tool and the ready notice. */
+const PLUGIN_VERSION = (() => {
+  try {
+    return String(JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version ?? '')
+  } catch {
+    return ''
+  }
+})()
+
+let readyAnnounced = false
+
+/**
+ * One "channel ready" message per process.
+ *
+ * Installing the plugin used to end with a manual test round trip; this hands the
+ * first proof of life straight to the chat that configured `defaultChatId`.
+ */
+async function announceReady(config) {
+  if (readyAnnounced) return
+  readyAnnounced = true
+  if (config?.readyNotice === false) return
+  try {
+    const chatId = String(provider().settings().defaultChatId ?? '').trim()
+    if (!chatId) return
+    const session = String(config?.sessionId ?? '').trim()
+    await provider().sendText({
+      chatId,
+      text: `✅ 飞书通道已就绪\n插件 dsh-channel-feishu v${PLUGIN_VERSION || '(unknown)'}\n`
+        + `入站长连接正常，接收会话=${session || '按消息新建'}`,
+    })
+    logInbound(config, { event: 'channel', result: 'ready-notice', chatId })
+  } catch (error) {
+    logInbound(config, { event: 'channel', result: 'ready-notice-failed', reason: errorText(error) })
+  }
 }
 
 const errorText = (error) => (error instanceof Error ? error.message : String(error))
@@ -2966,8 +3041,10 @@ function startInbound(ctx, config) {
           onCardAction: async (data) => await handleQuestionCardAction(scoped, config, data),
           onState: ({ ready, error }) => {
             setInboundState(config, { ready: Boolean(ready), transport: 'websocket', error: String(error ?? '') })
-            if (ready) warnTo(scoped, 'inbound long connection ready')
-            else if (error && error !== 'closed') warnTo(scoped, `inbound connection problem: ${error}`)
+            if (ready) {
+              warnTo(scoped, 'inbound long connection ready')
+              void announceReady(config)
+            } else if (error && error !== 'closed') warnTo(scoped, `inbound connection problem: ${error}`)
           },
         })
         if (disposed) {

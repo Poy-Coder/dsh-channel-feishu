@@ -9,9 +9,10 @@
         provider: feishu
         # Register the tools at all.
         enabled: true
-        # Long connection + inbound delivery. Off by default: an unattended
-        # channel should be an explicit choice.
-        inboundEnabled: false
+        # Long connection + inbound delivery. On by default: this is a channel
+        # plugin, so "installs and starts receiving" is the expected behaviour.
+        # Set false when the bot should only send (feishu_send_message/file).
+        inboundEnabled: true
         # Session inbound messages go to; `create` makes it when missing.
         sessionId: ''
         sessionMode: resume

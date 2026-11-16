@@ -1,8 +1,8 @@
 {
   "name": "dsh-channel-feishu",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "type": "module",
-  "description": "Feishu/Lark (飞书) channel for DeepSeek Harness: a chat bound to a DSH session, with streaming cards and attachments.",
+  "description": "Feishu/Lark (椋炰功) channel for DeepSeek Harness: a chat bound to a DSH session, with streaming cards and attachments.",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -41,6 +41,7 @@
     "AGENTS.md",
     "locale",
     "docs",
+    "scripts",
     "icon.svg",
     "LICENSE"
   ],
