@@ -368,8 +368,22 @@ function replyText(record) {
   return `${joined.slice(0, MAX_REPLY_CHARS)}\n\n…（内容过长，已截断）`
 }
 
-function summaryOf(text) {
-  const line = String(text ?? '').split('\n').map((value) => value.trim()).find(Boolean) ?? 'DSH'
+/**
+ * Last-resort plain-text rendering: a text message is not markdown, so the
+ * fallback strips the syntax instead of showing `**bold**` and `## heading`.
+ */
+export function plainTextFromMarkdown(text) {
+  return String(text ?? '')
+    .replace(/^#{1,6}\s+/gm, '')
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/__([^_]+)__/g, '$1')
+    .replace(/`{1,3}([^`]+)`{1,3}/g, '$1')
+    .replace(/^\s*[-*]\s+/gm, '· ')
+    .replace(/^\s*>\s?/gm, '')
+    .trim()
+}
+
+function summaryOf(text) {  const line = String(text ?? '').split('\n').map((value) => value.trim()).find(Boolean) ?? 'DSH'
   return line.length > 40 ? `${line.slice(0, 40)}…` : line
 }
 
@@ -471,6 +485,9 @@ function scheduleCardFlush(record, ctx, config) {
 
 const isRateLimited = (error) => /230020|frequency limit|rate limit/i.test(String(error?.message ?? error))
 
+/** Feishu closes a streaming card after a while; further element writes get 300309. */
+const isStreamingClosed = (error) => /300309|streaming mode is closed/i.test(String(error?.message ?? error))
+
 async function flushCard(record, ctx, config) {
   flushRan += 1
   const text = replyText(record)
@@ -513,9 +530,22 @@ async function flushCard(record, ctx, config) {
       logInbound(config, {
         event: 'card', result: 'rate-limited', sessionId: record.sessionId, turn: record.turn, sequence: card.sequence,
       })
+    } else if (isStreamingClosed(error) && (record.recreations ?? 0) < 3) {
+      // Feishu closes a streaming card after roughly ten minutes; a long turn
+      // then loses its card. Start a fresh one and keep writing there instead of
+      // degrading to a plain-text message (which would print raw markdown).
+      record.recreations = (record.recreations ?? 0) + 1
+      record.card = undefined
+      record.lastCardText = ''
+      record.backoffUntil = Date.now() + 1_000
+      logInbound(config, {
+        event: 'card', result: 'streaming-closed', sessionId: record.sessionId, turn: record.turn,
+        recreation: record.recreations, reason: errorText(error),
+      })
+      scheduleCardFlush(record, ctx, config)
     } else {
       record.cardFailed = true
-      warnTo(ctx, `card text update failed, will fall back to text: ${errorText(error)}`)
+      warnTo(ctx, `card text update failed: ${errorText(error)}`)
       logInbound(config, {
         event: 'card', result: 'update-failed', sessionId: record.sessionId, turn: record.turn, reason: errorText(error),
       })
@@ -698,8 +728,18 @@ export async function finalizeTurn(ctx, config, sessionId, turn, reason) {
         })
         return
       } catch (error) {
-        warnTo(ctx, `card finalize failed, falling back to text: ${errorText(error)}`)
+        warnTo(ctx, `card finalize failed: ${errorText(error)}`)
         logInbound(config, { event: 'card', result: 'close-failed', sessionId, turn, reason: errorText(error) })
+        // A dead streaming card (Feishu closes them after ~10 minutes) must not
+        // degrade to a plain-text message: markdown would show up as raw source.
+        // Post the answer as its own fresh card instead.
+        const posted = await postAnswerBelow(ctx, config, chatId, record, text)
+        if (posted) {
+          logInbound(config, {
+            event: 'card', result: 'reposted', sessionId, turn, cardId: posted, chars: text.length,
+          })
+          return
+        }
       }
     }
   }
@@ -715,7 +755,7 @@ export async function finalizeTurn(ctx, config, sessionId, turn, reason) {
     return
   }
   try {
-    await sendChannelText(config, chatId, text)
+    await sendChannelText(config, chatId, plainTextFromMarkdown(text))
     logInbound(config, { event: 'reply', result: 'sent', sessionId, turn, chatId, chars: text.length })
   } catch (error) {
     warnTo(ctx, `reply delivery failed: ${errorText(error)}`)
