@@ -92,7 +92,7 @@ export const Config = z.object({
   defaultChatId: z.string().default('').description('Destination used when a tool call omits receiveId.'),
   logFile: z.string().default('').description('Inbound diagnostics log path.'),
   readyNotice: z.boolean().default(true).description('Send one "channel ready" message to the default chat after the inbound long connection comes up.'),
-  mirrorUserMessages: z.boolean().default(true).description('Post messages typed outside Feishu (desktop GUI) into the owning chat, prefixed with 其他端.'),
+  mirrorUserMessages: z.boolean().default(true).description('Post messages typed outside Feishu (desktop GUI) into the owning chat, as "来自桌面端：<text>".'),
   logLevel: z.union([z.const('debug'), z.const('info'), z.const('warn'), z.const('error')])
     .default('info')
     .description('Minimum severity written to the diagnostics log.'),
@@ -427,12 +427,26 @@ async function ensureCard(record, ctx, config) {
 function startProgressHeartbeat(record, ctx, config) {
   if (record.heartbeat) return
   const timer = setInterval(() => {
-    if (!turns.has(record.key)) return
-    if (record.phase !== 'thinking' || !record.card) return
+    // Stop the moment this turn is no longer live: a disposed plugin leaves its
+    // records behind, and a surviving 10 s heartbeat would log forever.
+    if (!turns.has(record.key) || record.cardFailed || !record.card || record.phase !== 'thinking') {
+      clearInterval(timer)
+      if (record.heartbeat === timer) record.heartbeat = undefined
+      return
+    }
     scheduleCardFlush(record, ctx, config)
   }, PROGRESS_HEARTBEAT_MS)
   timer.unref?.()
   record.heartbeat = timer
+}
+
+/** Drop every per-turn timer; a disposed plugin must leave nothing ticking. */
+function disposeTurnTimers() {
+  for (const record of turns.values()) {
+    if (record.timer) { clearTimeout(record.timer); record.timer = undefined }
+    if (record.heartbeat) { clearInterval(record.heartbeat); record.heartbeat = undefined }
+  }
+  turns.clear()
 }
 
 /** Coalesce stream deltas: one Feishu write per CARD_FLUSH_MS at most. */
@@ -1488,16 +1502,17 @@ const channelPromptIds = new Set()
 
 /**
  * Mirror a message typed outside Feishu (desktop GUI) into the owning chat, so
- * one conversation can be followed from either surface.
+ * one conversation can be followed from either surface. The label names the
+ * surface only: the body follows as-is.
  */
-async function mirrorUserMessage(config, sessionId, text) {
+async function mirrorUserMessage(config, sessionId, text, surface = '桌面端') {
   const chatId = replyTargetOf(config, sessionId)
   if (!chatId) return
   const body = String(text ?? '').trim()
   if (!body) return
   const clipped = body.length > 2000 ? `${body.slice(0, 2000)}…` : body
   try {
-    await provider().sendText({ chatId, text: `👤 其他端：${clipped}` })
+    await provider().sendText({ chatId, text: `来自${surface}：${clipped}` })
     logInbound(config, { event: 'mirror', result: 'sent', sessionId, chatId })
   } catch (error) {
     logInbound(config, { event: 'mirror', result: 'failed', sessionId, reason: errorText(error) })
@@ -1846,8 +1861,13 @@ async function switchToNewSession(ctx, config, { chatId, senderId, firstMessage 
 
   if (firstMessage) {
     try {
+      // Track the id: an untracked prompt would be mirrored back into the chat
+      // as if it came from another surface — the very first message included.
+      const promptId = randomUUID()
+      channelPromptIds.add(promptId)
+      if (channelPromptIds.size > 200) channelPromptIds.delete(channelPromptIds.values().next().value)
       await handle.agent.followup({
-        id: randomUUID(),
+        id: promptId,
         role: 'user',
         content: [{ type: 'text', text: inboundUserText(firstMessage) }],
         source: { kind: 'user' },
@@ -3088,9 +3108,11 @@ function startInbound(ctx, config) {
         if (!sessionId || sessionId !== activeSessionId(config)) return
         const message = payload?.message
         if (!message?.id || channelPromptIds.has(message.id)) return
+        // Only messages a person typed on another surface are mirrored:
+        // schedule reminders and injected context snapshots are not conversation.
+        if (String(message.source?.kind ?? 'user') !== 'user') return
         const text = textOfMessage(message)
         if (!text.trim()) return
-        // Scheduled reminders are injected as user messages; they are not typed.
         if (/^\[SCHEDULE REMINDER/i.test(text.trim())) return
         void mirrorUserMessage(config, sessionId, text)
       })
@@ -3162,7 +3184,10 @@ export function apply(ctx, config = {}) {
     log: (record) => logInbound(config, record),
     credentials: typeof ctx.get === 'function' ? ctx.get('credentials') : undefined,
   })
-  ctx.effect?.(() => () => { activeProvider = undefined })
+  ctx.effect?.(() => () => {
+    activeProvider = undefined
+    disposeTurnTimers()
+  })
   ctx.tools.register(sendMessageTool(config))
   ctx.tools.register(sendFileTool(config))
   ctx.tools.register(statusTool(config))
