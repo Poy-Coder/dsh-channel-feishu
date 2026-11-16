@@ -109,15 +109,26 @@ Add to the profile's `cordis.patch.yml` (or the plugin's settings form):
     inboundEnabled: true
     sessionMode: create
     sessionId: session-<a fresh uuid>   # created on the first inbound message
-    allowedUsers: ["ou_…"]              # the human's open_id; empty means anyone
+    allowedUsers: ["ou_…"]              # the human's open_id; empty = first sender binds
     workspacePath: ""                   # empty → a non-system-drive default
     permissionPreset: danger-full-access # session policy inside that workspace
 ```
 
 Ask the user for their **open_id** first (`feishu_channel_status` does not expose it; the
 easiest path is to have them send one message with `allowedUsers` empty, read the sender
-id from `feishu-inbound.log`, then set the allowlist). Leaving `allowedUsers` empty means
-anyone in the tenant's visibility scope can drive the agent — call that out.
+id from `feishu-inbound.log`, then set the allowlist). An empty `allowedUsers` is not
+"open to everyone": the first sender binds the channel and later senders are refused —
+but that still lets a stranger take it, so prefer listing the open_id up front. The WeChat
+bundles do this automatically: the account that scanned the QR is written as the owner at
+login.
+
+The three defaults are security-relevant, so state them when you enable inbound:
+
+| Default | Meaning |
+|---|---|
+| `inboundEnabled: false` | nothing listens until the user opts in |
+| `allowedUsers: []` | first sender (Feishu) / logged-in account (WeChat) becomes owner |
+| `permissionPreset: danger-full-access` + `applyPermissionPreset: true` | unattended turns cannot answer approvals, so channel sessions get full access; `workspace-write` is the milder choice |
 
 ## 5. What the user will see
 

@@ -48,7 +48,7 @@ dsh plugin add dsh-channel-feishu
 
 ```bash
 dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu
-dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.14/dsh-channel-feishu-0.9.14.tgz
+dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.15/dsh-channel-feishu-0.9.15.tgz
 ```
 
 依赖必须用扁平结构装（非 ASCII 目录下 pnpm 的软链会把路径写坏）：`pnpm install --node-linker=hoisted`。
@@ -56,8 +56,17 @@ dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download
 > **更新插件后必须重启本机的 DSH**：通道代码在 DSH 启动时加载，没有热更新；
 > 只 `dsh plugin add <新版本>` 而不重启，跑的还是旧代码（`feishu_channel_status` 里的版本号也还是旧的）。
 
-安装包的 bundle patch 会插入通道行并默认开启入站，装完重启一次即可；
+安装包的 bundle patch 会插入通道行，**入站默认关闭**（`inboundEnabled: false`），装完重启一次即可；
 第一条飞书消息会自动建会话和「飞书」工作区，不需要先手填 `sessionId`。
+
+### 开启入站前先看这三个默认值
+
+| 配置 | 默认 | 含义 |
+|---|---|---|
+| `inboundEnabled` | `false` | 打开后，应用可见范围内的任何人都能驱动本地 Agent；确认允许名单后再开启 |
+| `allowedUsers` | `[]` | 空不是"谁都可以"：第一个发消息的人会**绑定**该通道，之后其他人被拒。想指定就显式列出 open_id |
+| `permissionPreset` / `applyPermissionPreset` | `danger-full-access` / `true` | 无人值守时没人能点审批，所以通道工作区里的会话会切到这个预设；觉得太大就改成 `workspace-write` 或关掉 apply |
+
 
 凭据写到 `~/.dsh/feishu-channel.json`（或设 `FEISHU_APP_ID` / `FEISHU_APP_SECRET`），
 也可以跑 `node scripts/setup.mjs`：它会从环境变量、现有凭据文件、各 profile 配置里找出
@@ -204,16 +213,16 @@ node <profile>/node_modules/dsh-channel-feishu/scripts/setup.mjs
   config:
     provider: feishu
     enabled: true
-    inboundEnabled: true        # 收消息；关掉只剩发送工具
+    inboundEnabled: false       # 默认关；开启后可见范围内的人都能驱动 Agent，先配 allowedUsers
     sessionMode: create         # 没有会话时，第一条消息自动建
     workspacePath: ""           # 空 = 按通道默认：飞书 dsh/feishu、微信 dsh/wechat
-    allowedUsers: []            # 空 = 第一个发消息的人绑定此通道
+    allowedUsers: []            # 空 = 第一个发消息的人绑定此通道；微信则是扫码登录的人
     streamingCards: true
     autoReply: true
     problemNotices: true        # 出错/崩溃时往飞书推原因；关掉只剩日志
     textProgressSeconds: 30     # 纯文本通道（微信）的进度间隔；0 = 不发进度
     mirrorUserMessages: true    # 桌面端消息转发到飞书
-    permissionPreset: danger-full-access
+    permissionPreset: danger-full-access   # 无人值守没人能点审批；嫌大改 workspace-write
     applyPermissionPreset: true
     region: feishu
     logLevel: info              # debug | info | warn | error
