@@ -48,10 +48,13 @@ dsh plugin add dsh-channel-feishu
 
 ```bash
 dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu
-dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.13/dsh-channel-feishu-0.9.13.tgz
+dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.14/dsh-channel-feishu-0.9.14.tgz
 ```
 
 依赖必须用扁平结构装（非 ASCII 目录下 pnpm 的软链会把路径写坏）：`pnpm install --node-linker=hoisted`。
+
+> **更新插件后必须重启本机的 DSH**：通道代码在 DSH 启动时加载，没有热更新；
+> 只 `dsh plugin add <新版本>` 而不重启，跑的还是旧代码（`feishu_channel_status` 里的版本号也还是旧的）。
 
 安装包的 bundle patch 会插入通道行并默认开启入站，装完重启一次即可；
 第一条飞书消息会自动建会话和「飞书」工作区，不需要先手填 `sessionId`。
@@ -73,6 +76,12 @@ manifest 里声明了 `engines.dsh`（当前 `>=0.2.2-rc.3 <0.3.0`），DSH 在�
 
 升级 DSH 后如果插件跟不上：`dsh plugin add dsh-channel-feishu@latest`（本地开发副本则改 `engines.dsh` 并重装），然后重启 DSH。
 
+### 更新插件后必须重启本机 DSH
+
+通道代码在 DSH **启动时**加载，没有热更新。只执行 `dsh plugin add <新版本>` 而不重启，跑的还是旧代码——插件管理器里显示的是新版本，实际行为仍是旧的（`feishu_channel_status` 返回的 `pluginVersion` 也是旧的）。
+
+所以每次更新插件后：**退出并重新打开 DSH**（或跑一次你本机惯用的重启脚本），再用 `feishu_channel_status` 确认 `pluginVersion` 已是新版本。这也是排查“更新了但问题没变化”的第一步。
+
 ### 兜底：插件没加载时由外部提醒
 
 插件被拦下时自己跑不起来，所以工作区里带了一个不依赖插件的看门狗 `check-plugin-health.ps1`：
@@ -88,9 +97,27 @@ schtasks /Create /SC MINUTE /MO 30 /TN "DSHFeishuPluginHealth" `
 
 不想用 Windows 计划任务，也可以在 DSH 里建一条定时任务定期执行这个脚本。
 
-## 纯文本通道（微信，规划中）
+## 纯文本通道（微信）
 
 微信 ClawBot 没有卡片，也不能编辑消息；实测客户端只在收到 FINISH 时渲染一次，重复 `client_id` 的 GENERATING 帧会被当成重复消息——所以这条通道**不做流式**，走另一套策略（`providers/wechat.js` + `providers/text-stream.js`）。
+
+**能用的部分**：文本/图片/文件双向收发、提问卡以纯文本编号发出、输入状态、进度消息、自动分条、独立工作区（`<非系统盘>/dsh/wechat`），飞书与微信可同时在线（两个 bundle）。
+
+**已知限制**（都是协议层，不是实现偷懒）：
+
+- 没有卡片、不能编辑消息，所以回答**一轮一条完整消息**，不做流式；
+- **没有历史消息接口**。iLink 只提供 `getupdates` 长轮询，飞书那种“断线后按时间补拉漏掉的消息”在微信侧**做不到**；
+- 因此微信通道用两个定时器兜底（`providers/wechat.js`）：长轮询超过 2 分钟没有完成就中止并重建（日志 `rebuild`）；游标 20 分钟没有新消息就重置一次 `get_updates_buf` 重新拉取（日志 `cursor-reset`，只接受最近 30 分钟的消息，已答的按 `message_id` 去重）。`wechat_channel_status` 的 `poll` 字段能看到 `lastOkAt` / `rebuilds` / `cursorResets` / `stalled`。
+
+**登录**：
+
+```bash
+node scripts/wechat-login.mjs --qr   # 二维码直接画在终端，并落一张 PNG 到 ~/.dsh/wechat-qr.png
+```
+
+流程是：发一条消息 → 手机扫码 → 凭据写入 `~/.dsh/wechat-channel.json`（0600，不入库、不进日志）。`--qr` 依赖 devDependency `qrcode`；没装时会退回打印 `QR_URL`，你可以自己渲染，不需要把登录 token 交给第三方二维码服务。
+
+**端到端自测**：`node scripts/wechat-e2e.mjs` —— 等你从微信发一条消息，然后按两段回复并打印耗时，用来验证“收得到 + 发得出”。
 
 **问答**：`ask_user_question` 以纯文本发出，编号选项 + 一句话说明怎么答：
 

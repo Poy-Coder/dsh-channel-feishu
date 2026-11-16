@@ -6,15 +6,15 @@
  *
  * Usage:
  *   node scripts/wechat-login.mjs            # print the QR URL and wait
+ *   node scripts/wechat-login.mjs --qr       # also render a scannable QR (terminal + PNG)
  *   node scripts/wechat-login.mjs --status   # read the saved credential
- *
- * The QR itself is rendered from the printed URL by `scripts/wechat-qr.mjs`
- * (and sent to the Feishu chat, so the phone has something to scan).
  */
 import { randomBytes } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
+
+import { renderQr } from './wechat-qr.mjs'
 
 const BASE = 'https://ilinkai.weixin.qq.com'
 const APP_ID = 'bot'
@@ -95,10 +95,20 @@ async function fetchQr() {
   return { qrcode: response.qrcode, url: response.qrcode_img_content }
 }
 
-async function main() {
-  let qr = await fetchQr()
+const WANT_QR = process.argv.includes('--qr')
+
+async function showQr(qr) {
   console.log(`QR_URL:${qr.url}`)
   console.log(`QR_ID:${qr.qrcode}`)
+  if (!WANT_QR) return
+  // The PNG is the only form a phone can scan; it lands next to the credential.
+  const rendered = await renderQr(qr.url, { out: join(dirname(STATE_PATH), 'wechat-qr.png') })
+  console.log(rendered ? `PNG:${rendered.png}` : 'QR_PNG:skipped')
+}
+
+async function main() {
+  let qr = await fetchQr()
+  await showQr(qr)
   console.log('WAITING_FOR_SCAN')
 
   const deadline = Date.now() + 5 * 60_000
@@ -132,8 +142,7 @@ async function main() {
       refreshes += 1
       if (refreshes > 3) { console.log('LOGIN_FAILED:qr expired too many times'); process.exit(1) }
       qr = await fetchQr()
-      console.log(`QR_URL:${qr.url}`)
-      console.log(`QR_ID:${qr.qrcode}`)
+      await showQr(qr)
       console.log('QR_REFRESHED')
       continue
     }

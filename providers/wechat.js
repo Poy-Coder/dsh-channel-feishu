@@ -32,6 +32,14 @@ const POLL_TIMEOUT_MS = 35_000
 const API_TIMEOUT_MS = 15_000
 const FILE_TTL_MS = 10_000
 const MAX_INBOUND_BYTES = 100 * 1024 * 1024
+// A long poll that never completes looks exactly like a quiet chat, and iLink has
+// no history endpoint to catch up from afterwards. Two timers are the only way to
+// tell the difference: one rebuilds a loop that stopped completing polls, the
+// other re-primes a cursor that looks stuck.
+const POLL_STALL_MS = 120_000
+const IDLE_CURSOR_RESET_MS = 20 * 60_000
+const CURSOR_RESET_LOOKBACK_MS = 30 * 60_000
+const POLL_WATCHDOG_MS = 30_000
 
 const UPLOAD_IMAGE = 1
 const UPLOAD_FILE = 3
@@ -131,6 +139,19 @@ export function wechatSessionPaused(accountId) {
   return pause.until
 }
 export const _resetWechatPauseForTest = () => { pause.accountId = ''; pause.until = 0 }
+
+/**
+ * Live long-poll health, exposed by `checkStatus` and `/status`.
+ *
+ * `lastOkAt` is the last completed `getupdates`; `rebuilds` counts the times the
+ * watchdog had to abort a poll that never returned; `cursorResets` counts the
+ * idle re-primes of `get_updates_buf`.
+ */
+const pollHealth = { lastOkAt: 0, rebuilds: 0, cursorResets: 0 }
+export function wechatPollHealth() {
+  return { ...pollHealth, stalled: pollHealth.lastOkAt > 0 && Date.now() - pollHealth.lastOkAt > POLL_STALL_MS }
+}
+export const _resetWechatPollHealthForTest = () => { pollHealth.lastOkAt = 0; pollHealth.rebuilds = 0; pollHealth.cursorResets = 0 }
 
 const sleep = (ms, signal) => new Promise((resolve) => {
   const timer = setTimeout(resolve, ms)
@@ -586,9 +607,15 @@ export function createWechatProvider(config = {}, deps = {}) {
           defaultChatId: settings.defaultChatId,
           baseUrl: settings.baseUrl,
           accountId: settings.accountId,
+          // The long poll is the only inbound path and has no history API, so
+          // this is the only honest answer to "is it still receiving?".
+          poll: wechatPollHealth(),
         }
       } catch (error) {
-        return { configured: true, tokenOk: false, defaultChatId: settings.defaultChatId, baseUrl: settings.baseUrl, error: String(error).slice(0, 200) }
+        return {
+          configured: true, tokenOk: false, defaultChatId: settings.defaultChatId,
+          baseUrl: settings.baseUrl, error: String(error).slice(0, 200), poll: wechatPollHealth(),
+        }
       }
     },
 
@@ -778,6 +805,13 @@ export function createWechatProvider(config = {}, deps = {}) {
       let cursor = loadWechatCursor(settings.accountId)
       let pollTimeoutMs = POLL_TIMEOUT_MS
       let failures = 0
+      // Health: when did a poll last complete, and when did a message last arrive.
+      pollHealth.lastOkAt = Date.now()
+      pollHealth.rebuilds = 0
+      pollHealth.cursorResets = 0
+      let lastMessageAt = Date.now()
+      let pollController
+      let cursorResetPending = false
       const loop = async () => {
         while (!stopped) {
           const pausedUntil = wechatSessionPaused(settings.accountId)
@@ -787,10 +821,24 @@ export function createWechatProvider(config = {}, deps = {}) {
             await wait(Math.min(60_000, pausedUntil - Date.now()))
             continue
           }
+          // Idle re-prime: a cursor that the server no longer honours keeps the
+          // poll "successful" and the chat silent forever. Starting from an empty
+          // cursor is the documented reset; already answered messages are dropped
+          // by message-id dedupe, and the age filter keeps a replay from waking
+          // up ancient history.
+          if (!cursorResetPending && cursor && Date.now() - lastMessageAt > IDLE_CURSOR_RESET_MS) {
+            cursorResetPending = true
+            pollHealth.cursorResets += 1
+            log({ event: 'channel', result: 'cursor-reset', reason: `no message for ${Math.round((Date.now() - lastMessageAt) / 60_000)} min` })
+          }
+          const resetting = cursorResetPending
+          pollController = new AbortController()
+          const onStop = () => pollController.abort()
+          try { stopController.signal.addEventListener('abort', onStop, { once: true }) } catch { /* ignore */ }
           try {
             const response = await post(settings, 'ilink/bot/getupdates', {
-              get_updates_buf: cursor, base_info: baseInfo(),
-            }, pollTimeoutMs, stopController.signal)
+              get_updates_buf: resetting ? '' : cursor, base_info: baseInfo(),
+            }, pollTimeoutMs, pollController.signal)
             const errcode = Number(response.errcode ?? response.ret ?? 0)
             if (errcode === STALE_TOKEN_ERRCODE) {
               // The server asked for a quiet period; pause all requests for an
@@ -802,6 +850,7 @@ export function createWechatProvider(config = {}, deps = {}) {
             }
             if (errcode !== 0) throw new Error(`getupdates ret=${errcode} ${response.errmsg ?? ''}`)
             failures = 0
+            pollHealth.lastOkAt = Date.now()
             // The server owns the long-poll window; follow its hint.
             const suggested = Number(response.longpolling_timeout_ms)
             if (Number.isFinite(suggested) && suggested > 0) {
@@ -811,12 +860,22 @@ export function createWechatProvider(config = {}, deps = {}) {
               cursor = response.get_updates_buf
               saveWechatCursor(settings.accountId, cursor)
             }
+            if (resetting) cursorResetPending = false
             if (!ready) {
               ready = true
               onState?.({ ready: true })
             }
             const messages = Array.isArray(response.msgs) ? response.msgs : []
+            // Only after a reset: ignore anything older than the lookback so a
+            // replayed backlog cannot turn into a pile of late answers.
+            const cutoff = resetting ? Date.now() - CURSOR_RESET_LOOKBACK_MS : 0
             for (const message of messages) {
+              const created = Number(message?.create_time_ms)
+              if (cutoff && Number.isFinite(created) && created > 0 && created < cutoff) {
+                log({ event: 'inbound', result: 'stale-skipped', messageId: String(message?.message_id ?? '') })
+                continue
+              }
+              lastMessageAt = Date.now()
               try { await onEvent(message) } catch (error) {
                 log({ event: 'inbound', result: 'handler-failed', reason: String(error).slice(0, 200) })
               }
@@ -835,12 +894,28 @@ export function createWechatProvider(config = {}, deps = {}) {
             // back off for 30 s so a broken network does not spin the loop.
             await wait(failures >= 3 ? 30_000 : 2_000)
             if (failures >= 3) failures = 0
+          } finally {
+            try { stopController.signal.removeEventListener('abort', onStop) } catch { /* ignore */ }
           }
         }
       }
+      // Watchdog: a poll that stops completing is invisible in every other
+      // signal (the socket looks fine, the process is alive, the chat is quiet).
+      // Abort the stuck request so the loop starts a fresh one.
+      const watchdog = setInterval(() => {
+        if (stopped) return
+        if (Date.now() - pollHealth.lastOkAt <= POLL_STALL_MS) return
+        pollHealth.rebuilds += 1
+        log({ event: 'channel', result: 'rebuild', reason: 'getupdates did not complete in time' })
+        onState?.({ ready: false, error: 'getupdates stalled, rebuilding long poll' })
+        pollHealth.lastOkAt = Date.now()
+        try { pollController?.abort() } catch { /* ignore */ }
+      }, POLL_WATCHDOG_MS)
+      watchdog.unref?.()
       void loop()
       return () => {
         stopped = true
+        clearInterval(watchdog)
         stopController.abort()
         void post(settings, 'ilink/bot/msg/notifystop', { base_info: baseInfo() }, 5_000).catch(() => {})
       }

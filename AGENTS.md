@@ -38,6 +38,11 @@ After installing, the three tools exist immediately (`feishu_send_message`,
 `inboundEnabled` defaults to `false` because an unattended bidirectional channel is
 an explicit choice.
 
+**Every install or update needs a DSH restart.** The channel code is loaded once at
+startup with no hot reload: running `dsh plugin add` and leaving DSH up keeps the old
+build running, and the symptom is "I updated it but nothing changed". Restart DSH, then
+check `feishu_channel_status` — its `pluginVersion` must name the version you installed.
+
 ## 2. Create the Feishu app — the type matters
 
 Tell the user to open <https://open.feishu.cn/app> and use **创建企业自建应用**

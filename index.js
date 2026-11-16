@@ -2626,7 +2626,7 @@ export async function handleInboundEvent(ctx, config, data, seen) {
   const seenAlready = seenKeys.find((key) => seen.has(key))
   if (seenAlready) {
     log({ event: 'inbound', result: 'dedupe-hit', messageId: inbound.messageId, key: seenAlready })
-    return
+    return false
   }
   // Mark an event only once it is settled. Marking before delivery loses the
   // message for good: a restart between the write and the followup leaves the id
@@ -2862,6 +2862,7 @@ export async function handleInboundEvent(ctx, config, data, seen) {
 
   warnTo(ctx, `delivered inbound Feishu message from ${senderId} to session ${sessionId} (${resolved.via})`)
   log({ event: 'inbound', result: 'delivered', senderId, chatId, sessionId, via: resolved.via })
+  return true
 }
 
 // ---------------------------------------------------------------------------
@@ -3730,8 +3731,10 @@ function startInbound(ctx, config) {
           const parsed = provider().parseInbound(item)
           if (!parsed || !parsed.dedupeKey) continue
           if (seen.has(parsed.dedupeKey)) continue
-          await handleInboundEvent(scoped, config, item, seen)
-          recovered += 1
+          // Count only what actually reached the session: a catch-up item that
+          // dedupe or an allowlist drops used to be reported as "recovered",
+          // which made the log claim a replay that never happened.
+          if (await handleInboundEvent(scoped, config, item, seen)) recovered += 1
         }
         logInbound(config, {
           event: 'reconcile',
