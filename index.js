@@ -2175,14 +2175,21 @@ export async function handleInboundEvent(ctx, config, data, seen) {
   const inbound = provider().parseInbound(data)
   if (!inbound) return
   const eventId = inbound.dedupeKey
-  if (eventId) {
-    if (seen.has(eventId)) return
+  if (eventId && seen.has(eventId)) return
+  // Mark an event only once it is settled. Marking before delivery loses the
+  // message for good: a restart between the write and the followup leaves the id
+  // "seen", so Feishu's redelivery is dropped silently.
+  const markSeen = () => {
+    if (!eventId) return
     seen.add(eventId)
     if (seen.size > INBOUND_DEDUPE_LIMIT) seen.delete(seen.values().next().value)
     persistSeenEvents(config, seen)
   }
 
-  if (inbound.senderType === 'app') return
+  if (inbound.senderType === 'app') {
+    markSeen()
+    return
+  }
 
   const senderId = inbound.senderId
   const allowed = Array.isArray(config.allowedUsers)
@@ -2191,6 +2198,7 @@ export async function handleInboundEvent(ctx, config, data, seen) {
   if (allowed.length > 0 && !allowed.includes(senderId)) {
     warnTo(ctx, `ignored message from ${senderId}: not in allowedUsers`)
     log({ event: 'inbound', result: 'dropped', reason: 'sender not in allowedUsers', senderId })
+    markSeen()
     return
   }
 
@@ -2198,6 +2206,7 @@ export async function handleInboundEvent(ctx, config, data, seen) {
   if (inbound.unsupported) {
     warnTo(ctx, `ignored unsupported message_type=${inbound.unsupported}`)
     log({ event: 'inbound', result: 'dropped', reason: `non-text message_type=${inbound.unsupported}`, senderId })
+    markSeen()
     return
   }
 
@@ -2249,6 +2258,7 @@ export async function handleInboundEvent(ctx, config, data, seen) {
 
   if (!text) {
     log({ event: 'inbound', result: 'dropped', reason: 'empty text', senderId, chatId })
+    markSeen()
     return
   }
   // Control phrases are consumed here, never delivered to the model.
@@ -2259,12 +2269,16 @@ export async function handleInboundEvent(ctx, config, data, seen) {
   const command = parseSlashCommand(text)
   if (command) {
     await handleSlashCommand(ctx, config, { ...command, chatId, senderId })
+    markSeen()
     return
   }
 
   // A pending question owns the next reply in its chat: a numbered, labelled or
   // free-text answer settles the tool call instead of starting a new turn.
-  if (consumeQuestionTextAnswer(ctx, config, { chatId, senderId, text })) return
+  if (consumeQuestionTextAnswer(ctx, config, { chatId, senderId, text })) {
+    markSeen()
+    return
+  }
 
   let sessionId = currentSessionId(config)
   if (!sessionId) {
@@ -2275,6 +2289,7 @@ export async function handleInboundEvent(ctx, config, data, seen) {
         event: 'inbound', result: 'dropped',
         reason: 'no sessionId configured (set sessionMode: create to bootstrap one)', senderId, chatId,
       })
+      markSeen()
       return
     }
     // Fresh install: the bundle row carries no sessionId. Create the channel's
@@ -2282,6 +2297,7 @@ export async function handleInboundEvent(ctx, config, data, seen) {
     // instead of dropping it — otherwise a new install looks connected but deaf.
     log({ event: 'inbound', result: 'bootstrap', reason: 'no session yet; creating one', senderId, chatId })
     await switchToNewSession(ctx, config, { chatId, senderId, firstMessage: text })
+    markSeen()
     return
   }
 
@@ -2289,6 +2305,7 @@ export async function handleInboundEvent(ctx, config, data, seen) {
   if (!resolved.agent) {
     warnTo(ctx, `inbound message dropped for session "${sessionId}": ${resolved.reason}`)
     log({ event: 'inbound', result: 'dropped', reason: resolved.reason, senderId, chatId, sessionId })
+    markSeen()
     return
   }
 
@@ -2313,6 +2330,8 @@ export async function handleInboundEvent(ctx, config, data, seen) {
       content: [{ type: 'text', text: inboundUserText(text) }],
       source: { kind: 'user' },
     })
+    // Delivered: only now is it safe to remember the event and drop redeliveries.
+    markSeen()
     rememberChat(config, sessionId, { chatId, senderId })
     // Acknowledge on the user's own message: the cheapest "I got it" there is.
     if (config.reactions !== false && inbound.messageId) {
