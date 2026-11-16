@@ -1887,6 +1887,14 @@ async function switchToNewSession(ctx, config, { chatId, senderId, firstMessage 
   }
 
   await attachToFeishuWorkspace(ctx, config, sessionId)
+  // Give the new session a name right away: an untitled row is easy to miss in
+  // the app's session list, which is what "/new did nothing" looked like.
+  try {
+    const stamp = new Date().toLocaleString('zh-CN', { hour12: false }).replace(/\//g, '-')
+    await ensureSessionTitle(ctx, config, handle.agent.session, `飞书会话 ${stamp}`)
+  } catch (error) {
+    warnTo(ctx, `session title failed: ${errorText(error)}`)
+  }
   if (config.notifyOnNew === false) return
   try {
     await sendChannelText(config, chatId, `已开新会话 ${sessionId}，接下来发消息都会进入这段对话。`)
@@ -2195,11 +2203,32 @@ export async function handleInboundEvent(ctx, config, data, seen) {
   const allowed = Array.isArray(config.allowedUsers)
     ? config.allowedUsers.map((value) => String(value)).filter(Boolean)
     : []
-  if (allowed.length > 0 && !allowed.includes(senderId)) {
-    warnTo(ctx, `ignored message from ${senderId}: not in allowedUsers`)
-    log({ event: 'inbound', result: 'dropped', reason: 'sender not in allowedUsers', senderId })
-    markSeen()
-    return
+  // An empty allowlist is not "open to everyone": the first sender binds the
+  // channel and later senders are refused. An unattended channel runs with
+  // danger-full-access, so a stranger who finds the bot must not get a shell.
+  if (allowed.length > 0) {
+    if (!allowed.includes(senderId)) {
+      warnTo(ctx, `ignored message from ${senderId}: not in allowedUsers`)
+      log({ event: 'inbound', result: 'dropped', reason: 'sender not in allowedUsers', senderId })
+      markSeen()
+      return
+    }
+  } else {
+    const owner = readChannelState(config).owner
+    const ownerId = String(owner?.openId ?? '').trim()
+    if (!ownerId) {
+      writeChannelState(config, { owner: { openId: senderId, at: Date.now() } })
+      log({ event: 'inbound', result: 'owner-bound', senderId, chatId: inbound.chatId })
+    } else if (ownerId !== senderId) {
+      log({ event: 'inbound', result: 'dropped', reason: 'sender is not the channel owner', senderId, ownerId })
+      void sendChannelText(
+        config,
+        inbound.chatId,
+        '这个飞书通道已绑定给其他用户使用。如需更换，请在 DSH 配置里显式设置 allowedUsers。',
+      ).catch(() => {})
+      markSeen()
+      return
+    }
   }
 
   const chatId = inbound.chatId
