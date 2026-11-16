@@ -6,7 +6,7 @@ on:
   pull_request:
 
 jobs:
-  smoke:
+  test:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -22,4 +22,19 @@ jobs:
           node-version: ${{ matrix.node }}
       # Flat node_modules: the same layout the published bundle is installed with.
       - run: pnpm install --node-linker=hoisted --no-frozen-lockfile
-      - run: node test/smoke.mjs
+      # Every hermetic test file runs, so a new one gates the release without
+      # this workflow needing an edit. `*-probe.mjs` files talk to the live
+      # Feishu tenant and need credentials, so they are skipped here.
+      - name: tests
+        run: |
+          set -e
+          for file in test/*.mjs; do
+            case "$file" in
+              *-probe.mjs)
+                echo "== skip $file (live probe, needs credentials)"
+                continue
+                ;;
+            esac
+            echo "== $file"
+            node "$file"
+          done

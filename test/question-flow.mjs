@@ -92,8 +92,14 @@ await new Promise((resolve) => setTimeout(resolve, 20))
 assert.equal(sent.cards.length, 1, 'question card was not sent')
 assert.equal(sent.attached[0].chatId, 'oc_fake')
 assert.equal(sent.attached[0].cardId, 'card_1')
-const buttons = sent.cards[0].body.elements.find((element) => element.tag === 'column_set')
-assert.ok(buttons.columns.length >= 2)
+// Options are queued as bare full-width buttons (one block each).
+const optionButtons = sent.cards[0].body.elements.filter((element) => element.tag === 'button')
+assert.equal(optionButtons.length, 3) // two options plus 跳过
+assert.deepEqual(optionButtons.map((button) => button.behaviors[0].value), [
+  { c: 'call-1', q: 0, o: 0 },
+  { c: 'call-1', q: 0, o: 1 },
+  { c: 'call-1', q: 0, skip: true },
+])
 
 const toast = await handleQuestionCardAction(ctx, config, {
   header: { event_type: 'card.action.trigger' },
