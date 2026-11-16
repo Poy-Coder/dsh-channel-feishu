@@ -472,15 +472,16 @@ export function parsePostContent(content) {
   try {
     parsed = JSON.parse(content ?? '{}')
   } catch {
-    return { text: '', imageKeys: [] }
+    return { text: '', imageKeys: [], files: [] }
   }
-  if (!parsed || typeof parsed !== 'object') return { text: '', imageKeys: [] }
+  if (!parsed || typeof parsed !== 'object') return { text: '', imageKeys: [], files: [] }
   const body = Array.isArray(parsed.content)
     ? parsed
     : (Object.values(parsed).find((value) => value && Array.isArray(value.content)) ?? parsed)
   const title = typeof body?.title === 'string' ? body.title.trim() : ''
   const lines = []
   const imageKeys = []
+  const files = []
   for (const paragraph of Array.isArray(body?.content) ? body.content : []) {
     if (!Array.isArray(paragraph)) continue
     let line = ''
@@ -491,11 +492,18 @@ export function parsePostContent(content) {
         if (key) imageKeys.push(key)
         continue
       }
+      // A file dragged into the box arrives as a post element (media/ile);
+      // treating it as plain text silently dropped the attachment.
+      if (tag === 'media' || tag === 'file' || typeof node?.file_key === 'string') {
+        const fileKey = typeof node?.file_key === 'string' ? node.file_key : ''
+        if (fileKey) files.push({ fileKey, fileName: typeof node?.file_name === 'string' ? node.file_name : '' })
+        continue
+      }
       if (typeof node?.text === 'string') line += node.text
     }
     if (line.trim()) lines.push(line.trim())
   }
-  return { text: [title, ...lines].filter(Boolean).join('\n').slice(0, POST_MAX_CHARS), imageKeys }
+  return { text: [title, ...lines].filter(Boolean).join('\n').slice(0, POST_MAX_CHARS), imageKeys, files }
 }
 
 /** Parse a single-image message body (`{"image_key":"img_..."}`). */
@@ -603,6 +611,7 @@ export async function downloadMessageFile(base, token, messageId, fileKey, fileN
     const parsed = parsePostContent(message.content)
     text = stripMentions(parsed.text, mentions)
     imageKeys = parsed.imageKeys
+    files = Array.isArray(parsed.files) ? parsed.files : []
   } else if (messageType === 'image') {
     const key = parseImageContent(message.content)
     if (key) imageKeys = [key]
@@ -715,6 +724,42 @@ export function createFeishuProvider(config = {}, deps = {}) {
         result.error = error instanceof Error ? error.message : String(error)
       }
       return result
+    },
+
+    /**
+     * Recent messages of one chat, normalized to the event shape `parseInbound`
+     * understands. The long connection is best-effort: this is the source of
+     * truth used to catch up after a reconnect.
+     */
+    async listRecentMessages({ chatId, sinceMs, limit = 50 }, signal) {
+      const resolved = await settingsAsync()
+      if (!resolved.appId || !resolved.appSecret || !chatId) return []
+      const token = await tenantToken(resolved.baseUrl, resolved.appId, resolved.appSecret, signal)
+      const since = Math.max(0, Math.floor((Number(sinceMs) || 0) / 1000))
+      const size = Math.min(50, Math.max(1, Number(limit) || 50))
+      const url = `${resolved.baseUrl}/open-apis/im/v1/messages?container_id_type=chat`
+        + `&container_id=${encodeURIComponent(chatId)}&start_time=${since}`
+        + `&sort_type=ByCreateTimeAsc&page_size=${size}`
+      const response = await fetch(url, { headers: { authorization: `Bearer ${token}` }, signal })
+      const payload = await response.json().catch(() => undefined)
+      if (!response.ok || (payload?.code ?? 0) !== 0) {
+        throw new Error(feishuError(payload, `Feishu list messages failed (HTTP ${response.status})`))
+      }
+      return (Array.isArray(payload?.data?.items) ? payload.data.items : []).map((item) => ({
+        header: { event_id: `catchup:${item.message_id}` },
+        message: {
+          message_id: String(item.message_id ?? ''),
+          chat_id: String(item.chat_id ?? chatId),
+          chat_type: 'p2p',
+          message_type: String(item.msg_type ?? ''),
+          content: String(item.body?.content ?? '{}'),
+          mentions: [],
+        },
+        sender: {
+          sender_id: { open_id: String(item.sender?.id ?? '') },
+          sender_type: String(item.sender?.sender_type ?? 'user'),
+        },
+      }))
     },
 
     async sendText({ chatId, text }, signal) {
@@ -893,15 +938,43 @@ export function createFeishuProvider(config = {}, deps = {}) {
       }
 
       let client
+      let clientLabel = ''
+      let clientSeq = 0
       let disposed = false
       let restartTimer
-      const publish = (ready, error = '') => onState?.({ ready, error })
+      let readyFlag = false
+      let published = ''
+      const publish = (ready, error = '') => {
+        readyFlag = ready
+        // One ready line per transition: SDK onReady and onReconnected both fire
+        // on the first connect, and duplicates made the log look like churn.
+        const key = `${ready ? 'up' : 'down'}:${error}`
+        if (key === published) return
+        published = key
+        onState?.({ ready, error })
+      }
       const dispatcher = new Lark.EventDispatcher({}).register({
         'im.message.receive_v1': async (data) => {
+          // Prove the event reached the plugin. Without this line a message lost
+          // before our filters is indistinguishable from one that never arrived —
+          // exactly the situation that made the field report impossible to read.
+          log({
+            event: 'inbound',
+            result: 'entry',
+            messageId: String(data?.message?.message_id ?? ''),
+            type: String(data?.message?.message_type ?? ''),
+            chatId: String(data?.message?.chat_id ?? ''),
+            eventId: String(data?.header?.event_id ?? data?.event_id ?? ''),
+          })
+          const startedAt = Date.now()
           try {
             await onEvent(data)
           } catch (error) {
             log({ event: 'channel', result: 'handler-failed', reason: error instanceof Error ? error.message : String(error) })
+          } finally {
+            // If the SDK acks only after this callback returns, the duration is
+            // the ack delay. Measure it so a slow turn is visible in the log.
+            log({ event: 'inbound', result: 'handled', messageId: String(data?.message?.message_id ?? ''), ms: Date.now() - startedAt })
           }
         },
         // Interactive card buttons: the answer travels back through the same
@@ -921,6 +994,12 @@ export function createFeishuProvider(config = {}, deps = {}) {
         restartTimer = setTimeout(async () => {
           restartTimer = undefined
           if (disposed) return
+          // The SDK may have recovered on its own while the timer ran; a fresh
+          // client would only drop the live connection.
+          if (readyFlag) {
+            log({ event: 'channel', result: 'restart-skipped', reason })
+            return
+          }
           log({ event: 'channel', result: 'restart', reason })
           try { client?.close?.() } catch { /* ignore */ }
           await startClient()
@@ -931,13 +1010,23 @@ export function createFeishuProvider(config = {}, deps = {}) {
       const startClient = async () => {
         if (disposed) return
         try {
+          // Never let two clients live at once: Feishu spreads events across the
+          // app's connections, and a second (dying) socket silently swallows the
+          // messages it wins.
+          if (client) {
+            log({ event: 'channel', result: 'client-close', client: clientLabel })
+            try { await client.close?.() } catch { /* ignore */ }
+            client = undefined
+          }
+          clientLabel = `ws-${++clientSeq}`
+          log({ event: 'channel', result: 'client-create', client: clientLabel })
           client = new Lark.WSClient({
             appId: resolved.appId,
             appSecret: resolved.appSecret,
             loggerLevel: Lark.LoggerLevel?.info,
             // 60 s without a pong (or any inbound frame) after a ping ⇒ the
             // socket is presumed dead and gets terminated to reconnect.
-            wsConfig: { pingTimeout: 60 },
+            wsConfig: { pingTimeout: Number(config.wsPingTimeoutSeconds ?? 60) },
             onReady: () => publish(true, ''),
             onReconnecting: () => publish(false, 'reconnecting'),
             onReconnected: () => publish(true, ''),
@@ -950,7 +1039,8 @@ export function createFeishuProvider(config = {}, deps = {}) {
             },
           })
           await client.start({ eventDispatcher: dispatcher })
-          if (!disposed) publish(true, '')
+          // onReady already published; a second ready line only adds noise.
+          if (!disposed && !readyFlag) publish(true, '')
         } catch (error) {
           const reason = error instanceof Error ? error.message : String(error)
           publish(false, reason)
@@ -964,6 +1054,7 @@ export function createFeishuProvider(config = {}, deps = {}) {
       return () => {
         disposed = true
         if (restartTimer) clearTimeout(restartTimer)
+        if (client) log({ event: 'channel', result: 'client-close', client: clientLabel })
         try { client?.close?.() } catch { /* ignore */ }
         publish(false, 'closed')
       }

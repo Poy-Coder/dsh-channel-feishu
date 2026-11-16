@@ -144,7 +144,7 @@ assert.match(post.text, /反代详情页/)
 // The same body wrapped per locale must resolve too.
 const wrapped = parsePostContent(JSON.stringify({ zh_cn: { title: '标题', content: [[{ tag: 'text', text: '正文' }]] } }))
 assert.equal(wrapped.text, '标题\n正文')
-assert.deepEqual(parsePostContent('not json'), { text: '', imageKeys: [] })
+assert.deepEqual(parsePostContent('not json'), { text: '', imageKeys: [], files: [] })
 assert.equal(parseImageContent('{"image_key":"img_v3_xyz"}'), 'img_v3_xyz')
 assert.equal(parseImageContent('{}'), '')
 assert.equal(imageExtension(Buffer.from('RIFF0000WEBP', 'latin1')), 'webp')

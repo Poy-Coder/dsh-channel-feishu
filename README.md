@@ -48,7 +48,7 @@ dsh plugin add dsh-channel-feishu
 
 ```bash
 dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu
-dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.11/dsh-channel-feishu-0.9.11.tgz
+dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.12/dsh-channel-feishu-0.9.12.tgz
 ```
 
 依赖必须用扁平结构装（非 ASCII 目录下 pnpm 的软链会把路径写坏）：`pnpm install --node-linker=hoisted`。
@@ -244,8 +244,19 @@ owner 记在通道状态文件里，删掉状态文件里的 `owner` 字段即�
 
 - `logLevel` 控制写入门槛，排查时设 `debug`；
 - 超过 4 MB 轮转为 `.log.1`，只保留一份；
-- 常见 `result`：`delivered`、`bootstrap`（自动建会话）、`owner-bound`、`dropped`（附 `reason`）、
+- 常见 `result`：`entry`（事件刚到达，带 `messageId`/`type`/`chatId`）、`handled`（回调耗时 `ms`）、
+  `delivered`、`bootstrap`（自动建会话）、`owner-bound`、`dropped`（附 `reason`）、
+  `parse-null` / `dedupe-hit`（被自身拦下，附原因）、`reconcile`（重连补拉：`clean` / `recovered count=N`）、
   `card-sent`、`answered`、`card-update-failed`。
+
+### 丢消息怎么看
+
+飞书长连接是 best-effort，事件可能落到一条正在退场的连接上而静默消失。因此：
+
+1. 每个事件到达时先写 `entry`——没有 `entry` 就是**事件没到**，不是被插件吞了；
+2. 重连成功后 5 秒会拉一次 `im/v1/messages` 对账（窗口 = 最近入站或 10 分钟），把没见过的用户消息补投，
+   日志记 `reconcile recovered count=N`；
+3. 同一时刻只允许一个 `WSClient`（`client-create/client-close` 带 `ws-N` 编号），避免双连接分食事件。
 
 ## 路线图
 

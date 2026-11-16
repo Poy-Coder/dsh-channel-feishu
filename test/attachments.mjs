@@ -58,4 +58,27 @@ assert.equal(parseInboundEvent(groupEvent).chatType, 'group')
 const p2pEvent = { ...fileEvent, message: { ...fileEvent.message, chat_type: 'p2p' } }
 assert.equal(parseInboundEvent(p2pEvent).chatType, 'p2p')
 
+// A file dragged into the composer arrives as a rich-text (`post`) element, not
+// as a `file` message; the post parser must surface it as an attachment.
+const postWithFile = {
+  header: { event_id: 'evt_2' },
+  message: {
+    message_id: 'om_2',
+    chat_id: 'oc_1',
+    chat_type: 'p2p',
+    message_type: 'post',
+    content: JSON.stringify({
+      title: '',
+      content: [[
+        { tag: 'text', text: '这是那边返回的 md' },
+        { tag: 'media', file_key: 'fk_md', file_name: 'error-log.md' },
+      ]],
+    }),
+  },
+  sender: { sender_id: { open_id: 'ou_1' }, sender_type: 'user' },
+}
+const parsedPost = parseInboundEvent(postWithFile)
+assert.equal(parsedPost.unsupported, '')
+assert.equal(parsedPost.text, '这是那边返回的 md')
+assert.deepEqual(parsedPost.files, [{ fileKey: 'fk_md', fileName: 'error-log.md' }])
 console.log('attachments: all assertions passed')

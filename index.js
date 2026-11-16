@@ -80,6 +80,8 @@ export const Config = z.object({
   streamingCards: z.boolean().default(true).description('Stream answers into a card; off sends plain text.'),
   textProgressSeconds: z.number().default(30)
     .description('Channels without editable messages (WeChat): seconds without answer text before one progress message is pushed; 0 disables progress messages. Raise it if 30s feels chatty.'),
+  wsPingTimeoutSeconds: z.number().default(60)
+    .description('Feishu long connection: seconds without a pong or inbound frame after a ping before the socket is treated as dead and reconnected. 0 disables the watchdog (a half-open socket then goes unnoticed).'),
   streamIntervalMs: z.number().default(900)
     .description('Channels without editable messages (WeChat): refresh interval of the live answer bubble in milliseconds. Larger is gentler on the connection, smaller looks smoother.'),
   autoReply: z.boolean().default(true).description('Deliver each turn\u2019s answer back to the originating chat.'),
@@ -367,7 +369,7 @@ function textOfMessage(message) {
 const THINKING_TEXT = '思考中…'
 
 /** Footer once the answer text starts streaming (the card opens on 等待回答). */
-const FOOTER_STREAMING = '流式输出中'
+const FOOTER_STREAMING = '回复中'
 
 /** How often the placeholder card refreshes its elapsed time while thinking. */
 const PROGRESS_HEARTBEAT_MS = 10_000
@@ -447,7 +449,9 @@ async function ensureCard(record, ctx, config) {
       try {
         created = await attempt()
       } catch (error) {
-        if (!isRateLimited(error)) throw error
+        // A single network blip used to lose the whole card; treat it like a
+        // rate limit and retry once.
+        if (!isRateLimited(error) && !isTransientNetworkError(error)) throw error
         // Chat-level limits are transient: wait once and retry before giving up.
         await new Promise((resolve) => { const t = setTimeout(resolve, 1_500); t.unref?.() })
         created = await attempt()
@@ -521,6 +525,10 @@ function scheduleCardFlush(record, ctx, config) {
 }
 
 const isRateLimited = (error) => /230020|frequency limit|rate limit/i.test(String(error?.message ?? error))
+/** Feishu rejected a stale sequence number: another write bumped it first. */
+const isSequenceConflict = (error) => /300317|sequence number compare failed/i.test(String(error?.message ?? error))
+/** A one-off network blip that is worth one retry before losing the card. */
+const isTransientNetworkError = (error) => /fetch failed|ECONNRESET|ETIMEDOUT|EAI_AGAIN|socket hang up|network error/i.test(String(error?.message ?? error))
 
 /** Feishu closes a streaming card after a while; further element writes get 300309. */
 const isStreamingClosed = (error) => /300309|streaming mode is closed/i.test(String(error?.message ?? error))
@@ -539,6 +547,7 @@ async function flushCard(record, ctx, config) {
   if (!card) return
   if (text === record.lastCardText) return
   record.flushing = true
+  let sequenceRetried = false
   try {
     card.sequence += 1
     await provider().card.update({ cardId: card.cardId, content: text, sequence: card.sequence })
@@ -560,6 +569,21 @@ async function flushCard(record, ctx, config) {
       } catch { /* footer is cosmetic */ }
     }
   } catch (error) {
+    if (isSequenceConflict(error) && !sequenceRetried) {
+      // Another write bumped the sequence first: retry once with a fresh number
+      // instead of freezing the card mid-answer (the "回答烂尾" symptom).
+      sequenceRetried = true
+      card.sequence += 1
+      try {
+        await provider().card.update({ cardId: card.cardId, content: text, sequence: card.sequence })
+        record.lastCardText = text
+        record.lastSentAt = Date.now()
+        record.updates = (record.updates ?? 0) + 1
+        return
+      } catch (again) {
+        error = again
+      }
+    }
     if (isRateLimited(error)) {
       // Keep the card: slow down instead of dropping to text, which would need
       // another message and hit the same limit.
@@ -765,7 +789,9 @@ export async function finalizeTurn(ctx, config, sessionId, turn, reason) {
           })
         } catch (error) {
           // The final write is the one that must land: back off once, then retry.
-          if (!isRateLimited(error)) throw error
+          // A single network blip used to lose the whole card; treat it like a
+        // rate limit and retry once.
+        if (!isRateLimited(error) && !isTransientNetworkError(error)) throw error
           await new Promise((resolve) => { const t = setTimeout(resolve, 1_500); t.unref?.() })
           card.sequence += 1
           await provider().card.close({
@@ -1572,6 +1598,8 @@ export async function ensureSessionTitle(ctx, config, session, text) {
 }
 
 const IDLE_RELEASE_CHECK_MS = 60_000
+// How far back the catch-up pull looks after a reconnect (plus the last inbound).
+const RECONCILE_WINDOW_MS = 10 * 60_000
 const IDLE_PROBE_MS = 2_000
 
 /** How long a dropped long connection may stay down before the chat is told. */
@@ -2517,9 +2545,17 @@ export async function handleInboundEvent(ctx, config, data, seen) {
   const log = (record) => logInbound(config, record)
   // The provider decides what the event means (text, rich text, image, ignored).
   const inbound = provider().parseInbound(data)
-  if (!inbound) return
+  if (!inbound) {
+    // Nothing to deliver, but say so: a silent return makes "the event never
+    // arrived" and "we dropped it" look identical in the log.
+    log({ event: 'inbound', result: 'parse-null', messageId: String(data?.message?.message_id ?? '') })
+    return
+  }
   const eventId = inbound.dedupeKey
-  if (eventId && seen.has(eventId)) return
+  if (eventId && seen.has(eventId)) {
+    log({ event: 'inbound', result: 'dedupe-hit', messageId: inbound.messageId })
+    return
+  }
   // Mark an event only once it is settled. Marking before delivery loses the
   // message for good: a restart between the write and the followup leaves the id
   // "seen", so Feishu's redelivery is dropped silently.
@@ -3585,6 +3621,58 @@ function startInbound(ctx, config) {
       releaseTimer.unref?.()
 
       let connectionCleanup = () => {}
+      // The long connection is best-effort: Feishu spreads events across an
+      // app's sockets and silently drops the ones sent to a dying one. After a
+      // reconnect, ask the API what was said while we were away and deliver
+      // anything we never saw — the only way to actually not lose a message.
+      let reconcileTimer
+      const reconcile = async () => {
+        if (disposed) return
+        if (typeof provider().listRecentMessages !== 'function') return
+        // The row rarely carries a chat id: the credential file does. Falling
+        // back to it is what makes the catch-up run at all.
+        let chatId = String(config.defaultChatId ?? '').trim()
+        if (!chatId) {
+          try { chatId = String((await provider().settingsAsync())?.defaultChatId ?? '').trim() } catch { /* best effort */ }
+        }
+        if (!chatId) {
+          logInbound(config, { event: 'reconcile', result: 'skipped', reason: 'no chat id' })
+          return
+        }
+        const since = Math.max(Number(inboundSnapshot().lastInboundAt ?? 0), Date.now() - RECONCILE_WINDOW_MS) - 5_000
+        let items = []
+        try {
+          items = await provider().listRecentMessages({ chatId, sinceMs: since, limit: 50 })
+        } catch (error) {
+          logInbound(config, { event: 'reconcile', result: 'failed', reason: errorText(error) })
+          return
+        }
+        let recovered = 0
+        for (const item of items) {
+          if (disposed) return
+          const senderType = String(item?.sender?.sender_type ?? '')
+          if (senderType && senderType !== 'user') continue
+          const parsed = provider().parseInbound(item)
+          if (!parsed || !parsed.dedupeKey) continue
+          if (seen.has(parsed.dedupeKey)) continue
+          await handleInboundEvent(scoped, config, item, seen)
+          recovered += 1
+        }
+        logInbound(config, {
+          event: 'reconcile',
+          result: recovered > 0 ? 'recovered' : 'clean',
+          count: recovered,
+          since,
+        })
+      }
+      const scheduleReconcile = () => {
+        if (reconcileTimer || disposed) return
+        reconcileTimer = setTimeout(() => {
+          reconcileTimer = undefined
+          void reconcile()
+        }, 5_000)
+        reconcileTimer.unref?.()
+      }
       // A connection that stays down is a silent channel: a normal reconnect lands
       // in seconds, so wait a moment and only then explain what happened.
       let connectionDownAt = 0
@@ -3628,6 +3716,7 @@ function startInbound(ctx, config) {
                 })
               }
               void announceReady(config)
+              scheduleReconcile()
               return
             }
             if (disposed) return
