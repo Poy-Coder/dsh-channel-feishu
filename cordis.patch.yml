@@ -25,6 +25,9 @@
         # back to the originating chat without the model calling a tool.
         streamingCards: true
         autoReply: true
+        # Messages typed on the desktop GUI are mirrored into the chat, so one
+        # conversation can be followed from either surface.
+        mirrorUserMessages: true
         # Unattended turns have nobody to answer approvals, so sessions in the
         # workspace switch to this preset (set applyPermissionPreset: false to
         # keep each session's own policy).

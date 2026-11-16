@@ -92,7 +92,7 @@ export const Config = z.object({
   defaultChatId: z.string().default('').description('Destination used when a tool call omits receiveId.'),
   logFile: z.string().default('').description('Inbound diagnostics log path.'),
   readyNotice: z.boolean().default(true).description('Send one "channel ready" message to the default chat after the inbound long connection comes up.'),
-  mirrorUserMessages: z.boolean().default(false).description('Post messages typed outside Feishu (desktop GUI) into the owning chat, prefixed with 其他端.'),
+  mirrorUserMessages: z.boolean().default(true).description('Post messages typed outside Feishu (desktop GUI) into the owning chat, prefixed with 其他端.'),
   logLevel: z.union([z.const('debug'), z.const('info'), z.const('warn'), z.const('error')])
     .default('info')
     .description('Minimum severity written to the diagnostics log.'),
