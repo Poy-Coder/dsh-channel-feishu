@@ -5,6 +5,24 @@
 
 用的是你自己在飞书开放平台新建的自建应用（独立机器人），不和别的通道共用事件。
 
+## 为什么这么设计
+
+常见的 IM 桥接是「群机器人 + webhook」：消息先转发到某个中间服务，再把回复贴回群里。这条通道反着做，几个取舍是有意的：
+
+- **一个应用只服务一个人**：自建应用 + 独立机器人，事件走长连接直达你本机，不经第三方中继，飞书侧也只是一条普通私聊；
+- **会话是主体，聊天窗口只是入口**：一条通道绑定一个 DSH 会话，上下文、工具调用、产物都留在本地会话里，换设备、重开 app 都不丢；
+- **要你拍板时发卡片，不靠解析自然语言**：结构化问答卡点选即回传，避免「回复 1 表示同意」这类靠猜的交互；
+- **附件落在工作区**：图片和文件直接进 `<workspacePath>/attachments/`，Agent 用本地路径读取，不用去临时目录里翻；
+- **无人值守优先**：会话激活即切权限预设，长任务不会卡在授权确认上；问答卡的回调也在通道内闭环，不需要开网页。
+
+代价是它只适合「一个人、一台机器、一个长期会话」的用法——这正是下面这条边界的由来。
+
+## 当前版本不支持群聊
+
+0.9.x 只支持**单聊**（你和机器人一对一）。把机器人拉进群不会工作：群消息的会话绑定关系不成立，插件按单聊逻辑处理会直接丢弃。
+
+群聊要解决的是另一个问题——群里谁在跟 Agent 说话、上下文怎么隔离、多人同时提问怎么排队。这些等实际反馈，不在当前版本里做。
+
 ## 它提供什么
 
 - **双向通道**：飞书私聊 → DSH 会话；一轮结束把答复自动发回原聊天，不需要模型调工具
@@ -25,7 +43,7 @@ dsh plugin add dsh-channel-feishu
 
 ```bash
 dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu
-dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.7/dsh-channel-feishu-0.9.7.tgz
+dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.8/dsh-channel-feishu-0.9.8.tgz
 ```
 
 依赖必须用扁平结构装（非 ASCII 目录下 pnpm 的软链会把路径写坏）：`pnpm install --node-linker=hoisted`。
@@ -145,6 +163,12 @@ owner 记在通道状态文件里，删掉状态文件里的 `owner` 字段即�
 - 超过 4 MB 轮转为 `.log.1`，只保留一份；
 - 常见 `result`：`delivered`、`bootstrap`（自动建会话）、`owner-bound`、`dropped`（附 `reason`）、
   `card-sent`、`answered`、`card-update-failed`。
+
+## 路线图
+
+- **多 IM**：通道层已经按 provider 抽开（`providers/registry.js`），接微信/企业微信只需实现同一份 provider 契约，会话与问答卡逻辑不用重写；
+- **扫码配置**：目标是「扫一下就把 `appId` / `appSecret` / `defaultChatId` 写进凭据文件」，替掉现在跑 `scripts/setup.mjs` 这一步；
+- **群聊**：视反馈决定，不在 0.9.x 范围内。
 
 ## 常见问题
 

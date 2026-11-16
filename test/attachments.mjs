@@ -46,4 +46,10 @@ assert.deepEqual(parsed.imageKeys, [])
 const sticker = { ...fileEvent, message: { ...fileEvent.message, message_type: 'sticker' } }
 assert.equal(parseInboundEvent(sticker).unsupported, 'sticker')
 
+// chat_type travels with the event: group chats are refused by the channel.
+const groupEvent = { ...fileEvent, message: { ...fileEvent.message, chat_type: 'group' } }
+assert.equal(parseInboundEvent(groupEvent).chatType, 'group')
+const p2pEvent = { ...fileEvent, message: { ...fileEvent.message, chat_type: 'p2p' } }
+assert.equal(parseInboundEvent(p2pEvent).chatType, 'p2p')
+
 console.log('attachments: all assertions passed')

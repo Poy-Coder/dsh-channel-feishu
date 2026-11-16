@@ -2239,6 +2239,19 @@ export async function handleInboundEvent(ctx, config, data, seen) {
     return
   }
 
+  // This channel is one conversation per bot: a group brings several speakers
+  // into one session, which the current design does not model.
+  if (inbound.chatType && inbound.chatType !== 'p2p') {
+    log({
+      event: 'inbound', result: 'dropped',
+      reason: `chat_type=${inbound.chatType} (group chat is not supported)`,
+      senderId: inbound.senderId, chatId: inbound.chatId,
+    })
+    warnTo(ctx, `ignored ${inbound.chatType} message: group chat is not supported`)
+    markSeen()
+    return
+  }
+
   const senderId = inbound.senderId
   const allowed = Array.isArray(config.allowedUsers)
     ? config.allowedUsers.map((value) => String(value)).filter(Boolean)

@@ -609,6 +609,7 @@ export async function downloadMessageFile(base, token, messageId, fileKey, fileN
     return {
       dedupeKey: String(event?.header?.event_id ?? ''),
       chatId: String(message.chat_id ?? ''),
+      chatType: String(message.chat_type ?? ''),
       senderId: String(sender.sender_id?.open_id ?? ''),
       senderType: String(sender.sender_type ?? ''),
       messageId: String(message.message_id ?? ''),
@@ -621,6 +622,7 @@ export async function downloadMessageFile(base, token, messageId, fileKey, fileN
   return {
     dedupeKey: String(event?.header?.event_id ?? ''),
     chatId: String(message.chat_id ?? ''),
+    chatType: String(message.chat_type ?? ''),
     senderId: String(sender.sender_id?.open_id ?? ''),
     senderType: String(sender.sender_type ?? ''),
     messageId: String(message.message_id ?? ''),
