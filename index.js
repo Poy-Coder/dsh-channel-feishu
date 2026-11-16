@@ -2192,6 +2192,20 @@ export function questionCardJson({ callId, questions, selections, skipped, note,
       })
     }
 
+    // Fine print (option descriptions plus the reply hint) sits right above the
+    // action row: explanations must not split the options from their buttons.
+    const finePrint = []
+    options.forEach((option, optionIndex) => {
+      if (!option?.description) return
+      finePrint.push(`<font color="grey">${optionIndex + 1} · ${option.description}</font>`)
+    })
+    finePrint.push(`<font color="grey">${multi
+      ? '可多选：点选项切换选中，选好后点「提交」。'
+      : '点上面的按钮作答，也可直接回复序号 / 选项文字。'}</font>`)
+    elements.push({ tag: 'markdown', text_size: 'notation', content: finePrint.join('\n') })
+
+    // The action row closes the block, so 提交 / 跳过 always sit at the very
+    // bottom no matter how many options the fold reveals.
     const actions = []
     if (multi) {
       actions.push({
@@ -2213,18 +2227,6 @@ export function questionCardJson({ callId, questions, selections, skipped, note,
     }
     if (actions.length === 1) elements.push(actions[0])
     else if (actions.length > 1) elements.push(fillRow(actions))
-
-    // Fine print (option descriptions plus the reply hint) always closes the
-    // block: mid-card notes read as if they described the buttons below them.
-    const finePrint = []
-    options.forEach((option, optionIndex) => {
-      if (!option?.description) return
-      finePrint.push(`<font color="grey">${optionIndex + 1} · ${option.description}</font>`)
-    })
-    finePrint.push(`<font color="grey">${multi
-      ? '可多选：点选项切换选中，选好后点「提交」。'
-      : '点上面的按钮作答，也可直接回复序号 / 选项文字。'}</font>`)
-    elements.push({ tag: 'markdown', text_size: 'notation', content: finePrint.join('\n') })
   })
   const noteText = note || '等待你的回答…'
   if (note !== null && noteText !== '') {

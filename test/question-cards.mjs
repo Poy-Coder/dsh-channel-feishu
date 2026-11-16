@@ -107,10 +107,13 @@ assert.deepEqual(panel.elements.map((button) => button.behaviors[0].value), [
   { c: 'call-4', q: 0, o: 7 },
 ])
 
-// The fine print closes the question block instead of splitting it.
+// Block order inside one question: options (folded) → 说明 → 提交/跳过.
 const finePrintIndex = many.body.elements.findIndex((element) => element.text_size === 'notation' && element.element_id === undefined)
-const lastButtonIndex = many.body.elements.map((element) => element.tag === 'button').lastIndexOf(true)
-assert.ok(finePrintIndex > lastButtonIndex, 'fine print must sit below the buttons')
+const thirdOptionIndex = many.body.elements.findIndex((element) => element.tag === 'button' && element.text.content.startsWith('3.'))
+const skipIndex = many.body.elements.findIndex((element) => element.tag === 'button' && element.text.content === '跳过')
+assert.ok(thirdOptionIndex >= 0 && skipIndex >= 0)
+assert.ok(finePrintIndex > thirdOptionIndex, '说明 must sit below the option buttons')
+assert.ok(skipIndex > finePrintIndex, '提交/跳过 must close the block')
 
 // A stepped card carries the question's batch offset so a click maps back to
 // the right question of the batch.
