@@ -29,7 +29,8 @@
   },
   "icon": "icon.svg",
   "engines": {
-    "node": ">=20.18.1"
+    "node": ">=20.18.1",
+    "dsh": ">=0.2.2-rc.3 <0.3.0"
   },
   "dsh": {
     "bundle": {

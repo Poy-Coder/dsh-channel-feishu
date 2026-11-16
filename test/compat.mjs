@@ -37,7 +37,7 @@ assert.equal(compareSemver('x', '0.2.2'), undefined)
 
 // 3. The range the manifest declares, evaluated the way DSH does it.
 const range = '>=0.2.2-rc.3 <0.3.0'
-assert.deepEqual(PLUGIN_MANIFEST.engines, { dsh: range })
+assert.equal(PLUGIN_MANIFEST.engines?.dsh, range)
 assert.equal(versionSatisfies('0.2.2-rc.3', range), true)
 assert.equal(versionSatisfies('0.2.2', range), true)
 assert.equal(versionSatisfies('0.2.9', range), true)
