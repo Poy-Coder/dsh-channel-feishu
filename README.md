@@ -8,6 +8,11 @@
 
 用的是你自己在飞书开放平台新建的自建应用（独立机器人），不和别的通道共用事件。
 
+**配套**：
+
+- [`dsh-im-indicator`](https://github.com/Poy-Coder/dsh-im-indicator) —— 在 DSH 左侧会话列表标出「哪条会话正被通道驱动」，一行胶囊 + 一个状态点，零依赖 7 kB；
+- [`dsh-channel-wechat-ilink`](https://github.com/Poy-Coder/dsh-channel-wechat-ilink) —— 同一套框架的微信通道，可与飞书同时在线。
+
 ## 为什么这么设计
 
 常见的 IM 桥接是「群机器人 + webhook」：消息先转发到某个中间服务，再把回复贴回群里。这条通道反着做，几个取舍是有意的：
@@ -48,7 +53,7 @@ dsh plugin add dsh-channel-feishu
 
 ```bash
 dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu
-dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.15/dsh-channel-feishu-0.9.15.tgz
+dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.16/dsh-channel-feishu-0.9.16.tgz
 ```
 
 依赖必须用扁平结构装（非 ASCII 目录下 pnpm 的软链会把路径写坏）：`pnpm install --node-linker=hoisted`。
@@ -110,7 +115,7 @@ schtasks /Create /SC MINUTE /MO 30 /TN "DSHFeishuPluginHealth" `
 
 微信 ClawBot 没有卡片，也不能编辑消息；实测客户端只在收到 FINISH 时渲染一次，重复 `client_id` 的 GENERATING 帧会被当成重复消息——所以这条通道**不做流式**，走另一套策略（`providers/wechat.js` + `providers/text-stream.js`）。
 
-**能用的部分**：文本/图片/文件双向收发、提问卡以纯文本编号发出、输入状态、进度消息、自动分条、独立工作区（`<非系统盘>/dsh/wechat`），飞书与微信可同时在线（两个 bundle）。
+**能用的部分**：文本/图片/文件双向收发、提问卡以纯文本编号发出、输入状态、进度消息、一轮一条完整回答（超长才拆续条）、独立工作区（`<非系统盘>/dsh/wechat`），飞书与微信可同时在线（两个 bundle）。
 
 **已知限制**（都是协议层，不是实现偷懒）：
 
@@ -153,7 +158,7 @@ node scripts/wechat-login.mjs --qr   # 二维码直接画在终端，并落一�
 
 同一条进度不重复：只有工具或调用次数变了才发新的，间隔至少 3 分钟、每轮最多 3 条；正文一开始就不再发进度。飞书通道忽略这个参数（它用卡片每 10 秒刷新）。
 
-**正文**：**一轮一条完整消息**，不拆段、不做流式帧（客户端限制，实测无法原地刷新）。超过 4000 字的回答才按上限拆续条；发送失败会隔 800ms 重试一次。
+**正文**：**一轮一条完整消息**，不拆段、不做流式帧（客户端限制，实测无法原地刷新）。只有超过 1800 字的回答才按上限拆续条；发送失败会隔 800ms 重试一次。
 
 **投递可靠性**：`context_token` 由入站消息签发且会过期，过期后发送返回 `ret=-2 prepare failed`；插件不会删除已存的 token（删了会让后续回复彻底发不出去），失败时只做一次无 token 重试并记录 `finish-failed`。
 
