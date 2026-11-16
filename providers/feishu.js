@@ -321,7 +321,9 @@ function cardJson(text, summary) {
         {
           tag: 'markdown',
           element_id: 'note_1',
-          content: '<font color="grey">流式输出中</font>',
+          // The card opens before the model has produced anything, so the footer
+          // starts as a wait notice; flushCard flips it once the answer streams.
+          content: '<font color="grey">等待回答</font>',
           text_size: 'notation',
         },
       ],

@@ -19,7 +19,7 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join, parse } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -89,6 +89,9 @@ export const Config = z.object({
   appSecret: z.string().default('').description('Optional app secret; prefer the credentials store or credentials file.'),
   defaultChatId: z.string().default('').description('Destination used when a tool call omits receiveId.'),
   logFile: z.string().default('').description('Inbound diagnostics log path.'),
+  logLevel: z.union([z.const('debug'), z.const('info'), z.const('warn'), z.const('error')])
+    .default('info')
+    .description('Minimum severity written to the diagnostics log.'),
   stateFile: z.string().default('').description('Channel state path (current session, chat memory).'),
   inboundFilesDir: z.string().default('').description('Where inbound images are saved.'),
 })
@@ -301,6 +304,7 @@ function turnRecord(sessionId, turn) {
     committed: '', stepStream: '', stepBlocks: new Set(),
     card: undefined, cardFailed: false, sentByTool: false, lastCardText: '', updates: 0,
     backoffUntil: 0, cardCreating: undefined, timer: undefined, lastSentAt: 0, phase: 'thinking',
+    activity: '', toolSteps: 0, startedAt: Date.now(), heartbeat: undefined, footerText: '等待回答',
   }
   turns.set(key, record)
   if (turns.size > 64) {
@@ -321,12 +325,41 @@ function textOfMessage(message) {
 /** Shown from turn start until the first answer token arrives. */
 const THINKING_TEXT = '思考中…'
 
-/** The text a card/text reply should carry right now: committed steps + live deltas. */
-function replyText(record) {
+/** Footer once the answer text starts streaming (the card opens on 等待回答). */
+const FOOTER_STREAMING = '流式输出中'
+
+/** How often the placeholder card refreshes its elapsed time while thinking. */
+const PROGRESS_HEARTBEAT_MS = 10_000
+
+/** The answer text committed so far, without any placeholder. */
+function answerTextOf(record) {
   const head = String(record.committed ?? '').trimEnd()
   const tail = String(record.stepStream ?? '')
-  const joined = [head, tail].filter(Boolean).join(head && tail ? '\n\n' : '')
-  if (!joined) return record.phase === 'answering' ? '' : THINKING_TEXT
+  return [head, tail].filter(Boolean).join(head && tail ? '\n\n' : '')
+}
+
+/**
+ * Placeholder body for a turn that has no answer yet.
+ *
+ * A tool-heavy turn can spend minutes before the first token, and a card that
+ * only says 思考中… looks frozen. The placeholder therefore names the tool that
+ * is running, counts the calls, and ticks the elapsed time.
+ */
+export function progressText(record, now = Date.now()) {
+  const lines = [THINKING_TEXT]
+  const seconds = Math.max(0, Math.round((now - (record?.startedAt ?? now)) / 1000))
+  const meta = []
+  if (record?.activity) meta.push(`正在执行 ${record.activity}`)
+  if ((record?.toolSteps ?? 0) > 0) meta.push(`已调用 ${record.toolSteps} 个工具`)
+  if (seconds >= 5) meta.push(`已用时 ${seconds}s`)
+  if (meta.length > 0) lines.push('', `<font color="grey">${meta.join(' · ')}</font>`)
+  return lines.join('\n')
+}
+
+/** The text a card/text reply should carry right now: committed steps + live deltas. */
+function replyText(record) {
+  const joined = answerTextOf(record)
+  if (!joined) return record.phase === 'answering' ? '' : progressText(record)
   if (joined.length <= MAX_REPLY_CHARS) return joined
   return `${joined.slice(0, MAX_REPLY_CHARS)}\n\n…（内容过长，已截断）`
 }
@@ -386,6 +419,18 @@ async function ensureCard(record, ctx, config) {
   return await record.cardCreating
 }
 
+/** Keep the placeholder card's elapsed time moving while the turn has no text. */
+function startProgressHeartbeat(record, ctx, config) {
+  if (record.heartbeat) return
+  const timer = setInterval(() => {
+    if (!turns.has(record.key)) return
+    if (record.phase !== 'thinking' || !record.card) return
+    scheduleCardFlush(record, ctx, config)
+  }, PROGRESS_HEARTBEAT_MS)
+  timer.unref?.()
+  record.heartbeat = timer
+}
+
 /** Coalesce stream deltas: one Feishu write per CARD_FLUSH_MS at most. */
 function scheduleCardFlush(record, ctx, config) {
   if (record.timer) return
@@ -428,6 +473,20 @@ async function flushCard(record, ctx, config) {
     record.lastCardText = text
     record.updates = (record.updates ?? 0) + 1
     record.lastSentAt = Date.now()
+    // The footer opens on 等待回答 (nothing has streamed yet) and switches here
+    // the first time real answer text lands.
+    if (record.phase === 'answering' && record.footerText !== FOOTER_STREAMING) {
+      try {
+        card.sequence += 1
+        await provider().card.update({
+          cardId: card.cardId,
+          content: `<font color="grey">${FOOTER_STREAMING}</font>`,
+          sequence: card.sequence,
+          elementId: 'note_1',
+        })
+        record.footerText = FOOTER_STREAMING
+      } catch { /* footer is cosmetic */ }
+    }
   } catch (error) {
     if (isRateLimited(error)) {
       // Keep the card: slow down instead of dropping to text, which would need
@@ -453,6 +512,42 @@ async function flushCard(record, ctx, config) {
 }
 
 /**
+ * Post a finished answer as its own card so it lands below the question cards,
+ * and turn the original turn card into a pointer to it.
+ */
+async function postAnswerBelow(ctx, config, chatId, record, text) {
+  try {
+    const cardId = await provider().card.create({ text, summary: summaryOf(text) })
+    await provider().card.attach({ chatId, cardId })
+    // This card is born complete, so its footer never claims to be waiting.
+    try {
+      await provider().card.update({
+        cardId, content: '<font color="grey">完成</font>', sequence: 1, elementId: 'note_1',
+      })
+    } catch { /* footer is cosmetic */ }
+    await provider().card.close({ cardId, sequence: 2, summary: summaryOf(text) })
+    if (record.card) {
+      try {
+        record.card.sequence += 1
+        await provider().card.update({
+          cardId: record.card.cardId,
+          content: '<font color="grey">本轮回答见下方 ↓</font>',
+          sequence: record.card.sequence,
+        })
+        record.card.sequence += 1
+        await provider().card.close({
+          cardId: record.card.cardId, sequence: record.card.sequence, summary: '回答见下方',
+        })
+      } catch { /* the new card already carries the answer */ }
+    }
+    return cardId
+  } catch (error) {
+    warnTo(ctx, `posting the answer below the questions failed: ${errorText(error)}`)
+    return ''
+  }
+}
+
+/**
  * Close one turn: finish the card that already carries the answer, or send the
  * answer as a plain text message when cards are off or unavailable.
  */
@@ -464,6 +559,10 @@ export async function finalizeTurn(ctx, config, sessionId, turn, reason) {
   if (record.timer) {
     clearTimeout(record.timer)
     record.timer = undefined
+  }
+  if (record.heartbeat) {
+    clearInterval(record.heartbeat)
+    record.heartbeat = undefined
   }
   // Drop the acknowledgement reaction now that the turn is over.
   const ack = ackReactions.get(sessionId)
@@ -477,7 +576,7 @@ export async function finalizeTurn(ctx, config, sessionId, turn, reason) {
 
   // Nothing but the placeholder: finish the card with a clear note instead of
   // leaving a "thinking" card open forever.
-  if (!text || text === THINKING_TEXT) {
+  if (!answerTextOf(record).trim()) {
     if (cardsOn && record.card) {
       const note = reason?.kind === 'error' ? '（这一轮出错了，没有产生回复）' : '（没有产生文字回答）'
       try {
@@ -504,6 +603,20 @@ export async function finalizeTurn(ctx, config, sessionId, turn, reason) {
       } catch { /* best effort */ }
     }
     return
+  }
+
+  // A turn that asked a question posted its question cards *below* the turn
+  // card, so updating the turn card would land the answer above them and read as
+  // silence. Post the answer as a fresh card underneath instead.
+  if (cardsOn && record.askedQuestion && chatId) {
+    const posted = await postAnswerBelow(ctx, config, chatId, record, text)
+    if (posted) {
+      logInbound(config, {
+        event: 'card', result: 'answered-below', sessionId, turn, cardId: posted,
+        chars: text.length, turnCard: record.card?.cardId ?? '',
+      })
+      return
+    }
   }
 
   if (cardsOn) {
@@ -606,10 +719,17 @@ export function observeSessionEvent(ctx, config, session, event) {
     // first token), then the card placeholder.
     ensureCotRun(ctx, config, target, data.turn)
     void ensureCard(record, ctx, config).catch(() => {})
+    startProgressHeartbeat(record, ctx, config)
     return
   }
   if (event.type === 'tool/call') {
     if (data.name === 'feishu_send_message') turnRecord(target, data.turn).sentByTool = true
+    const record = turnRecord(target, data.turn)
+    // The card placeholder names the running tool, so a long tool phase still
+    // shows progress instead of a frozen 思考中….
+    record.activity = String(data.name ?? '')
+    record.toolSteps = (record.toolSteps ?? 0) + 1
+    scheduleCardFlush(record, ctx, config)
     const run = cotRuns.get(`${target}|${data.turn}`)
     if (run) {
       if (run.reasoningOpen) {
@@ -626,6 +746,11 @@ export function observeSessionEvent(ctx, config, session, event) {
     return
   }
   if (event.type === 'tool/result') {
+    const record = turnRecord(target, data.turn)
+    if (record.activity) {
+      record.activity = ''
+      scheduleCardFlush(record, ctx, config)
+    }
     const run = cotRuns.get(`${target}|${data.turn}`)
     if (run) {
       const text = textOfMessage(data.message)
@@ -644,6 +769,10 @@ export function observeSessionEvent(ctx, config, session, event) {
     const text = textOfMessage(data.message)
     if (!text) return
     record.phase = 'answering'
+    if (record.heartbeat) {
+      clearInterval(record.heartbeat)
+      record.heartbeat = undefined
+    }
     record.committed = record.committed ? `${record.committed}\n\n${text}` : text
     record.stepStream = ''
     record.stepBlocks = new Set()
@@ -1304,13 +1433,62 @@ function inboundLogPath(config) {
   return String(config.logFile ?? '').trim() || join(dirname(credentialsFilePath()), 'feishu-inbound.log')
 }
 
+const LOG_RANK = { debug: 10, info: 20, warn: 30, error: 40 }
+const LOG_ROTATE_BYTES = 4 * 1024 * 1024
+
+/**
+ * Severity of one diagnostic record.
+ *
+ * Callers may pass `level` explicitly; otherwise it is inferred from the event,
+ * result and reason, so the existing call sites gain levels without a rewrite.
+ */
+export function logLevelOf(record) {
+  const declared = String(record?.level ?? '')
+  if (Object.prototype.hasOwnProperty.call(LOG_RANK, declared)) return declared
+  const text = `${record?.event ?? ''} ${record?.result ?? ''} ${record?.reason ?? ''}`.toLowerCase()
+  if (/fail|error|denied|refused|invalid/.test(text)) return 'error'
+  if (record?.event === 'debug') return 'debug'
+  if (/drop|skip|timeout|abort|rate-limited|closed|bad-value|empty|stale|missing/.test(text)) return 'warn'
+  return 'info'
+}
+
+// One writer owns the file. Writes stay synchronous on purpose: a record must be
+// readable the moment the caller returns (the smoke test and `tail` both assume
+// it), and a ~100-byte append costs far less than the Feishu round trip it
+// describes. Rotation keeps the file bounded.
+const logBytes = new Map()
+
 /** Append one JSONL diagnostic record. Must never throw into the delivery path. */
 function logInbound(config, record) {
   try {
-    appendFileSync(inboundLogPath(config), `${JSON.stringify({ time: Date.now(), ...record })}\n`)
+    const level = logLevelOf(record)
+    const floor = LOG_RANK[config?.logLevel] ?? LOG_RANK.info
+    if ((LOG_RANK[level] ?? LOG_RANK.info) < floor) return
+    const path = inboundLogPath(config)
+    const line = `${JSON.stringify({ time: Date.now(), level, ...record })}\n`
+    let size = logBytes.get(path)
+    if (size === undefined) {
+      try { size = statSync(path).size } catch { size = 0 }
+    }
+    if (size > LOG_ROTATE_BYTES) {
+      // Keep exactly one previous file: diagnostics are for the last failure,
+      // not for an unbounded archive.
+      try { renameSync(path, `${path}.1`) } catch { /* keep appending */ }
+      size = 0
+    }
+    appendFileSync(path, line)
+    logBytes.set(path, size + Buffer.byteLength(line))
   } catch {
     // a broken log path must not break message delivery
   }
+}
+
+/** Leveled facade for new call sites, so they do not pass `level` by hand. */
+export const channelLog = {
+  debug: (config, record) => logInbound(config, { ...record, level: 'debug' }),
+  info: (config, record) => logInbound(config, { ...record, level: 'info' }),
+  warn: (config, record) => logInbound(config, { ...record, level: 'warn' }),
+  error: (config, record) => logInbound(config, { ...record, level: 'error' }),
 }
 
 /** Default provider/model route, when the profile exposes the default-model service. */
@@ -2523,6 +2701,19 @@ function finishQuestion(config, pending, status, explicitAnswers) {
   return true
 }
 
+/**
+ * Flag the newest live turn of a session, so that turn's answer is posted below
+ * the question cards instead of into the card opened at turn start.
+ */
+function markQuestionAsked(sessionId) {
+  let latest
+  for (const record of turns.values()) {
+    if (record.sessionId !== sessionId) continue
+    if (!latest || record.turn > latest.turn) latest = record
+  }
+  if (latest) latest.askedQuestion = true
+}
+
 /** Send the question as a card; fall back to plain text if card creation fails. */
 async function sendQuestionCard(ctx, config, pending) {
   const step = pending.step ?? 0
@@ -2541,6 +2732,7 @@ async function sendQuestionCard(ctx, config, pending) {
     const messageId = await provider().card.attach({ chatId: pending.chatId, cardId })
     pending.cardId = cardId
     pending.messageId = messageId
+    markQuestionAsked(pending.sessionId)
     logInbound(config, {
       event: 'question', result: 'card-sent', sessionId: pending.sessionId,
       callId: pending.callId, chatId: pending.chatId, cardId, messageId,
