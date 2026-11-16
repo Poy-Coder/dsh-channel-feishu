@@ -2022,6 +2022,23 @@ export async function handleInboundEvent(ctx, config, data, seen) {
 /** Card element that carries the waiting/answered note under the buttons. */
 export const QA_STATUS_ELEMENT_ID = 'qa_note'
 
+/** Per-question element id prefix that mirrors a multi-select question's ticks. */
+export const QA_SELECTION_ELEMENT_PREFIX = 'qa_sel_'
+
+/**
+ * Selection line for one multi-select question.
+ * @param chosen - a Set of selected option indexes, or undefined before any click
+ */
+export function questionSelectionText(question, chosen) {
+  const picked = chosen && typeof chosen[Symbol.iterator] === 'function' ? [...chosen] : []
+  if (picked.length === 0) return '<font color="grey">已选：无</font>'
+  const labels = picked
+    .slice()
+    .sort((left, right) => left - right)
+    .map((index) => String(question?.options?.[index]?.label ?? `选项${index + 1}`))
+  return `<font color="grey">已选：${labels.join('、')}</font>`
+}
+
 /** One answerable request per session; the value is the pending record below. */
 const pendingQuestions = new Map()
 const questionStats = { asked: 0, answered: 0, skipped: 0, failed: 0 }
@@ -2072,74 +2089,142 @@ function normalizeQuestions(questions) {
 }
 
 /**
+ * One column_set row whose columns share the width, so every element fills the
+ * card instead of collapsing to its natural (tiny) width on a narrow phone.
+ */
+function fillRow(children) {
+  return {
+    tag: 'column_set',
+    flex_mode: 'none',
+    columns: children.map((element) => ({
+      tag: 'column',
+      width: 'weighted',
+      weight: 1,
+      elements: [element],
+    })),
+  }
+}
+
+/** Option rows shown before the rest fold into a collapsible panel. */
+const OPTION_ROWS_VISIBLE = 3
+
+/** A folded group the client expands in place, with no server round trip. */
+function collapsibleGroup(title, elements) {
+  return {
+    tag: 'collapsible_panel',
+    expanded: false,
+    header: {
+      title: { tag: 'markdown', content: title },
+      vertical_align: 'center',
+      icon: { tag: 'standard_icon', token: 'down-small-ccm_outlined', size: '16px 16px' },
+      icon_position: 'right',
+      icon_expanded_angle: -180,
+    },
+    elements,
+  }
+}
+
+/**
  * Build the interactive question card (schema 2.0).
  *
  * Every option becomes a callback button whose value carries the call id and
  * the (question, option) indexes, so a click needs no server-side lookup by
- * button text. A multi-select question also gets an explicit 提交 button; a
- * free-text question relies on the reply fallback.
+ * button text. Options are queued one per row as bare fill-width buttons:
+ * a row of auto-width buttons squeezes every label to an ellipsis on mobile,
+ * and side-by-side options are hard to hit. Only the 提交 / 跳过 pair shares a
+ * row. Option descriptions and the reply hint drop to notation size, and an
+ * option list longer than OPTION_ROWS_VISIBLE folds its tail into a collapsible
+ * panel. A multi-select question also gets an explicit 提交 button; a free-text
+ * question relies on the reply fallback.
  */
-export function questionCardJson({ callId, questions, selections, skipped, note, answered }) {
+export function questionCardJson({ callId, questions, selections, skipped, note, answered, offset = 0, title }) {
   const elements = []
   questions.forEach((question, index) => {
     const options = Array.isArray(question?.options) ? question.options : []
+    const multi = question?.multiSelect === true
     const lines = []
     if (question?.header) lines.push(`**${question.header}**`)
     if (question?.question) lines.push(question.question)
     if (question?.detail) {
       lines.push(`> ${String(question.detail).split('\n').join('\n> ')}`)
     }
-    if (options.length > 0) {
-      options.forEach((option, optionIndex) => {
-        const chosen = selections?.[index]?.has?.(optionIndex) === true
-        const label = String(option?.label ?? '')
-        const suffix = option?.description ? ` — ${option.description}` : ''
-        lines.push(`${optionIndex + 1}. ${label}${chosen ? ' ✅' : ''}${suffix}`)
-      })
-      const hint = question?.multiSelect === true
-        ? '可多选：点选项切换选中，选好后点「提交」。'
-        : '点下面的按钮，或直接回复序号 / 选项文字。'
-      lines.push(`<font color="grey">${hint}</font>`)
-    } else {
-      lines.push('<font color="grey">直接回复文字作为答案；回复「跳过」表示不作答。</font>')
-    }
     elements.push({ tag: 'markdown', content: lines.join('\n') })
-    if (options.length === 0) return
-    const columns = options.map((option, optionIndex) => ({
-      tag: 'column',
-      width: 'auto',
-      elements: [{
+    if (options.length === 0) {
+      elements.push({
+        tag: 'markdown',
+        text_size: 'notation',
+        content: '<font color="grey">直接回复文字作为答案；回复「跳过」表示不作答。</font>',
+      })
+      return
+    }
+
+    // One bare button per option: a top-level button is always its own block,
+    // so the options queue vertically instead of sharing a squeezed row.
+    const buttons = options.map((option, optionIndex) => {
+      const chosen = selections?.[index]?.has?.(optionIndex) === true
+      const label = String(option?.label ?? '').trim().slice(0, 40) || `选项${optionIndex + 1}`
+      return {
         tag: 'button',
-        text: { tag: 'plain_text', content: plainLabel(option?.label).slice(0, 30) || `选项${optionIndex + 1}` },
+        width: 'fill',
+        text: { tag: 'plain_text', content: `${optionIndex + 1}. ${label}${chosen ? ' ✓' : ''}` },
         type: optionIndex === 0 ? 'primary' : 'default',
-        behaviors: [{ type: 'callback', value: { c: callId, q: index, o: optionIndex } }],
-      }],
-    }))
-    if (question?.multiSelect === true) {
-      columns.push({
-        tag: 'column',
-        width: 'auto',
-        elements: [{
-          tag: 'button',
-          text: { tag: 'plain_text', content: '提交' },
-          type: 'primary',
-          behaviors: [{ type: 'callback', value: { c: callId, q: index, submit: true } }],
-        }],
+        behaviors: [{ type: 'callback', value: { c: callId, q: offset + index, o: optionIndex } }],
+      }
+    })
+    elements.push(...buttons.slice(0, OPTION_ROWS_VISIBLE))
+    if (buttons.length > OPTION_ROWS_VISIBLE) {
+      // A long option list would push the question off the screen; fold the
+      // tail into a panel the client expands without a server round trip. The
+      // panel title stays neutral because the toggle never calls back, so the
+      // channel cannot rewrite it to 收起 after an expansion.
+      elements.push(collapsibleGroup(`其余 ${buttons.length - OPTION_ROWS_VISIBLE} 项（点击展开 / 收起）`, buttons.slice(OPTION_ROWS_VISIBLE)))
+    }
+
+    // Multi-select ticks are invisible on the buttons themselves (a button's
+    // text cannot be patched), so the card carries one status line per
+    // multi-select question and the channel rewrites it on every click.
+    if (multi) {
+      elements.push({
+        tag: 'markdown',
+        element_id: `${QA_SELECTION_ELEMENT_PREFIX}${offset + index}`,
+        text_size: 'notation',
+        content: questionSelectionText(question, selections?.[index]),
+      })
+    }
+
+    const actions = []
+    if (multi) {
+      actions.push({
+        tag: 'button',
+        width: 'fill',
+        text: { tag: 'plain_text', content: '提交' },
+        type: 'primary',
+        behaviors: [{ type: 'callback', value: { c: callId, q: offset + index, submit: true } }],
       })
     }
     if (answered !== true) {
-      columns.push({
-        tag: 'column',
-        width: 'auto',
-        elements: [{
-          tag: 'button',
-          text: { tag: 'plain_text', content: '跳过' },
-          type: 'default',
-          behaviors: [{ type: 'callback', value: { c: callId, q: index, skip: true } }],
-        }],
+      actions.push({
+        tag: 'button',
+        width: 'fill',
+        text: { tag: 'plain_text', content: '跳过' },
+        type: 'default',
+        behaviors: [{ type: 'callback', value: { c: callId, q: offset + index, skip: true } }],
       })
     }
-    elements.push({ tag: 'column_set', flex_mode: 'none', columns })
+    if (actions.length === 1) elements.push(actions[0])
+    else if (actions.length > 1) elements.push(fillRow(actions))
+
+    // Fine print (option descriptions plus the reply hint) always closes the
+    // block: mid-card notes read as if they described the buttons below them.
+    const finePrint = []
+    options.forEach((option, optionIndex) => {
+      if (!option?.description) return
+      finePrint.push(`<font color="grey">${optionIndex + 1} · ${option.description}</font>`)
+    })
+    finePrint.push(`<font color="grey">${multi
+      ? '可多选：点选项切换选中，选好后点「提交」。'
+      : '点上面的按钮作答，也可直接回复序号 / 选项文字。'}</font>`)
+    elements.push({ tag: 'markdown', text_size: 'notation', content: finePrint.join('\n') })
   })
   const noteText = note || '等待你的回答…'
   if (note !== null && noteText !== '') {
@@ -2151,11 +2236,20 @@ export function questionCardJson({ callId, questions, selections, skipped, note,
     })
   }
   const count = questions.length
+  const headline = title || (count > 1 ? `有 ${count} 个问题` : '需要你的回答')
   return {
     schema: '2.0',
-    config: { update_multi: true, width_mode: 'fill', summary: { content: count > 1 ? `有 ${count} 个问题` : '需要你的回答' } },
+    // streaming_mode keeps the CardKit entity open for element updates: without
+    // it every status write fails with `300309 streaming mode is closed`. The
+    // card is closed once the question settles.
+    config: {
+      streaming_mode: true,
+      update_multi: true,
+      width_mode: 'fill',
+      summary: { content: headline },
+    },
     header: {
-      title: { tag: 'plain_text', content: count > 1 ? `有 ${count} 个问题` : '需要你的回答' },
+      title: { tag: 'plain_text', content: headline },
       template: answered === true ? 'green' : 'blue',
     },
     body: { elements },
@@ -2233,14 +2327,20 @@ export function applyQuestionSelection(pending, value) {
   return true
 }
 
+/** True when one question of the batch already holds a usable answer. */
+export function isStepSettled(pending, index) {
+  const question = pending?.questions?.[index]
+  if (!question) return false
+  if (pending.skipped.has(index)) return true
+  if (question.options.length === 0) return false
+  const picked = pending.selections?.[index]
+  if (!picked || picked.size === 0) return false
+  return pending.submitted.has(index)
+}
+
 export function isQuestionComplete(pending) {
   if (!pending || pending.questions.length === 0) return false
-  return pending.questions.every((question, index) => {
-    if (pending.skipped.has(index)) return true
-    if (question.options.length === 0) return false
-    if (question.multiSelect) return pending.submitted.has(index) && pending.selections[index].size > 0
-    return pending.selections[index].size > 0 && pending.submitted.has(index)
-  })
+  return pending.questions.every((question, index) => isStepSettled(pending, index))
 }
 
 /** The batch the host accepts: one item per question, in order. */
@@ -2250,7 +2350,8 @@ export function questionAnswersOf(pending) {
     const selected = chosen
       .filter((optionIndex) => optionIndex >= 0 && optionIndex < question.options.length)
       .map((optionIndex) => question.options[optionIndex].label)
-    return { id: question.id, selected }
+    const custom = pending.customs?.[index]
+    return { id: question.id, selected, ...(custom ? { custom: String(custom) } : {}) }
   })
 }
 
@@ -2265,6 +2366,7 @@ function questionChatOf(config, sessionId) {
   return ''
 }
 
+/** Rewrite every live element of one question card (ticks, then the status line). */
 async function refreshQuestionCard(config, pending, status, answers) {
   if (!pending.cardId) return
   const summary = status === 'answered'
@@ -2277,19 +2379,110 @@ async function refreshQuestionCard(config, pending, status, answers) {
           ? '已取消。'
           : '等待你的回答…'
   if (!summary) return
+  // One card carries exactly one step, so only that step's elements exist to
+  // rewrite: its multi-select tick line (when it has options) and the status line.
+  const writes = []
+  const index = pending.step ?? 0
+  const question = pending.questions[index]
+  if (question?.multiSelect === true) {
+    writes.push({
+      elementId: `${QA_SELECTION_ELEMENT_PREFIX}${index}`,
+      content: questionSelectionText(question, pending.selections?.[index]),
+    })
+  }
+  writes.push({ elementId: QA_STATUS_ELEMENT_ID, content: `<font color="grey">${summary}</font>` })
+  for (const write of writes) {
+    try {
+      pending.sequence += 1
+      await provider().card.update({
+        cardId: pending.cardId,
+        content: write.content,
+        sequence: pending.sequence,
+        elementId: write.elementId,
+      })
+    } catch (error) {
+      logInbound(config, {
+        event: 'question', result: 'card-update-failed',
+        sessionId: pending.sessionId, callId: pending.callId, elementId: write.elementId,
+        reason: errorText(error),
+      })
+    }
+  }
+}
+
+/** Settle the card: close its streaming mode so it stops accepting updates. */
+async function closeQuestionCard(config, pending, status, answers) {
+  if (!pending.cardId) return
   try {
     pending.sequence += 1
-    await provider().card.update({
+    await provider().card.close({
       cardId: pending.cardId,
-      content: `<font color="grey">${summary}</font>`,
       sequence: pending.sequence,
-      elementId: QA_STATUS_ELEMENT_ID,
+      summary: status === 'answered'
+        ? `已选择：${(answers ?? []).map((item) => item.selected.join('、') || (item.custom ? `“${item.custom}”` : '跳过')).join('；')}`
+        : status === 'timeout' ? '等待超时，已跳过。' : status === 'skipped' ? '已跳过。' : '已取消。',
     })
   } catch (error) {
     logInbound(config, {
-      event: 'question', result: 'card-update-failed',
+      event: 'question', result: 'card-close-failed',
       sessionId: pending.sessionId, callId: pending.callId, reason: errorText(error),
     })
+  }
+}
+
+/** Fold one parsed text reply into the pending state for its step. */
+function recordTextAnswer(pending, index, answer) {
+  const question = pending.questions[index]
+  const picked = new Set()
+  for (const label of answer?.selected ?? []) {
+    const at = question.options.findIndex((option) => sameLabel(option.label, label))
+    if (at >= 0) picked.add(at)
+  }
+  pending.selections[index] = picked
+  pending.submitted.add(index)
+  if (picked.size === 0) pending.skipped.add(index)
+  if (answer?.custom !== undefined) {
+    pending.customs = pending.customs ?? {}
+    pending.customs[index] = String(answer.custom)
+  }
+}
+
+/**
+ * Close the answered step's card and post the next question as its own card.
+ *
+ * A batch of questions is asked one at a time, so each card stays short and the
+ * user only sees the question that is actually waiting for an answer.
+ */
+async function advanceQuestionCard(ctx, config, pending) {
+  if (pending.advancing === true) return false
+  pending.advancing = true
+  try {
+    const index = pending.step
+    const question = pending.questions[index]
+    const chosen = pending.selections[index] instanceof Set ? [...pending.selections[index]] : []
+    const selected = chosen
+      .sort((left, right) => left - right)
+      .map((at) => question.options[at]?.label ?? '')
+      .filter(Boolean)
+    const settled = [{ id: question.id, selected }]
+    await refreshQuestionCard(config, pending, 'answered', settled)
+    await closeQuestionCard(config, pending, 'answered', settled)
+    pending.step = index + 1
+    pending.cardId = ''
+    pending.messageId = ''
+    pending.sequence = 1
+    const sent = await sendQuestionCard(ctx, config, pending)
+    if (!sent) {
+      finishQuestion(config, pending, 'answered')
+    } else if (pending.timeoutMs > 0) {
+      // Every step gets the full answer window instead of sharing one deadline.
+      if (pending.timer) clearTimeout(pending.timer)
+      pending.timer = setTimeout(() => finishQuestion(config, pending, 'timeout'), pending.timeoutMs)
+      pending.timer.unref?.()
+    }
+    return sent
+  } finally {
+    pending.advancing = false
   }
 }
 
@@ -2324,13 +2517,24 @@ function finishQuestion(config, pending, status, explicitAnswers) {
     try { pending.resolve(answers) } catch { /* ignore */ }
   }
   void refreshQuestionCard(config, pending, status, answers)
+    .then(() => closeQuestionCard(config, pending, status, answers))
   return true
 }
 
 /** Send the question as a card; fall back to plain text if card creation fails. */
 async function sendQuestionCard(ctx, config, pending) {
+  const step = pending.step ?? 0
+  const question = pending.questions[step]
+  const total = pending.questions.length
   try {
-    const card = questionCardJson({ callId: pending.callId, questions: pending.questions, note: '等待你的回答…' })
+    const card = questionCardJson({
+      callId: pending.callId,
+      questions: [question],
+      selections: [pending.selections[step]],
+      offset: step,
+      title: total > 1 ? `第 ${step + 1}/${total} 题` : undefined,
+      note: total > 1 ? `第 ${step + 1}/${total} 题 · 等待你的回答…` : '等待你的回答…',
+    })
     const cardId = await provider().card.createRaw({ card })
     const messageId = await provider().card.attach({ chatId: pending.chatId, cardId })
     pending.cardId = cardId
@@ -2338,6 +2542,7 @@ async function sendQuestionCard(ctx, config, pending) {
     logInbound(config, {
       event: 'question', result: 'card-sent', sessionId: pending.sessionId,
       callId: pending.callId, chatId: pending.chatId, cardId, messageId,
+      step, count: total,
     })
     return true
   } catch (error) {
@@ -2349,7 +2554,7 @@ async function sendQuestionCard(ctx, config, pending) {
     })
   }
   try {
-    await provider().sendText({ chatId: pending.chatId, text: questionText(pending.questions) })
+    await provider().sendText({ chatId: pending.chatId, text: questionText([question]) })
     logInbound(config, {
       event: 'question', result: 'text-sent', sessionId: pending.sessionId,
       callId: pending.callId, chatId: pending.chatId,
@@ -2388,6 +2593,9 @@ export async function answerUserQuestion(ctx, config, request, next) {
     selections: questions.map(() => new Set()),
     skipped: new Set(),
     submitted: new Set(),
+    customs: {},
+    step: 0,
+    timeoutMs,
     messageId: '', cardId: '', sequence: 1,
     done: false, status: '', signal: request?.signal,
     resolve: undefined, reject: undefined, timer: undefined, abortHandler: undefined,
@@ -2445,6 +2653,23 @@ export async function handleQuestionCardAction(ctx, config, raw) {
     ?? [...pendingQuestions.values()].find((item) => item.chatId === action.chatId && String(action.value?.c ?? '') === item.callId)
   if (!pending) return { toast: { type: 'info', content: '这个问题已经结束。' } }
   if (pending.chatId && action.chatId && action.chatId !== pending.chatId) return undefined
+  // Each step owns its own card; a click on an earlier (or already answered)
+  // card must not touch the question that is live now.
+  const clickedStep = Number(action.value?.q)
+  if (Number.isInteger(clickedStep) && clickedStep !== pending.step) {
+    return { toast: { type: 'info', content: '这题已经答过了。' } }
+  }
+  if (pending.advancing === true) {
+    return { toast: { type: 'info', content: '正在发送下一题…' } }
+  }
+  // 提交 with nothing ticked would only re-render the card; say so instead.
+  if (action.value?.submit === true) {
+    const question = pending.questions[pending.step]
+    const picked = pending.selections?.[pending.step]
+    if (question?.multiSelect === true && (!picked || picked.size === 0)) {
+      return { toast: { type: 'warning', content: '先勾选至少一项，再点「提交」。' } }
+    }
+  }
   if (!applyQuestionSelection(pending, action.value)) {
     logInbound(config, {
       event: 'question', result: 'card-bad-value', sessionId: pending.sessionId,
@@ -2452,7 +2677,12 @@ export async function handleQuestionCardAction(ctx, config, raw) {
     })
     return { toast: { type: 'error', content: '无法识别的选择。' } }
   }
-  if (isQuestionComplete(pending)) {
+  if (isStepSettled(pending, pending.step)) {
+    if (pending.step + 1 < pending.questions.length) {
+      // Queue the next question as its own card once this one is answered.
+      void advanceQuestionCard(ctx, config, pending)
+      return { toast: { type: 'success', content: `第 ${pending.step + 2} 题已发出。` } }
+    }
     finishQuestion(config, pending, 'answered')
     return { toast: { type: 'success', content: '已提交。' } }
   }
@@ -2462,20 +2692,28 @@ export async function handleQuestionCardAction(ctx, config, raw) {
 
 /**
  * Consume a text reply as the answer to one pending question in that chat.
- * @returns true when the message was the answer and must not start a turn.
+ * @returns true when the message was the answer and must not start a turn
  */
 export function consumeQuestionTextAnswer(ctx, config, { chatId, senderId, text }) {
   if (config.questionCards === false) return false
   const pending = [...pendingQuestions.values()].find((item) => item.chatId === chatId && !item.done)
   if (!pending) return false
-  const answers = parseQuestionText(text, pending.questions)
+  if (pending.advancing === true) return false
+  const index = pending.step ?? 0
+  const question = pending.questions[index]
+  const answers = parseQuestionText(text, [question])
   if (!answers) return false
   lastInboundAt = Date.now()
-  finishQuestion(config, pending, 'answered', answers)
+  recordTextAnswer(pending, index, answers[0])
   logInbound(config, {
     event: 'question', result: 'answered', via: 'text', sessionId: pending.sessionId,
-    callId: pending.callId, senderId, chatId,
+    callId: pending.callId, senderId, chatId, step: index,
   })
+  if (index + 1 < pending.questions.length) {
+    void advanceQuestionCard(ctx, config, pending)
+  } else {
+    finishQuestion(config, pending, 'answered')
+  }
   return true
 }
 

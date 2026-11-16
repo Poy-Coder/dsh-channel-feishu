@@ -11,12 +11,15 @@ import { join } from 'node:path'
 process.env.DSH_HOME = mkdtempSync(join(tmpdir(), 'feishu-question-'))
 
 const {
+  QA_SELECTION_ELEMENT_PREFIX,
   QA_STATUS_ELEMENT_ID,
   applyQuestionSelection,
   isQuestionComplete,
+  isStepSettled,
   parseQuestionText,
   questionAnswersOf,
   questionCardJson,
+  questionSelectionText,
 } = await import('../index.js')
 const { normalizeCardAction } = await import('../providers/feishu.js')
 
@@ -40,27 +43,89 @@ assert.equal(card.schema, '2.0')
 assert.equal(card.header.title.content, '需要你的回答')
 const elements = card.body.elements
 assert.ok(elements.some((element) => element.tag === 'markdown' && element.content.includes('用哪种方式实现')))
-const row = elements.find((element) => element.tag === 'column_set')
-assert.ok(row, 'option row is missing')
-const buttonValues = row.columns.flatMap((column) => column.elements.map((button) => button.behaviors[0].value))
-assert.deepEqual(buttonValues, [
+// Options queue as bare full-width buttons: one block each, never a shared row.
+const buttons = elements.filter((element) => element.tag === 'button')
+assert.deepEqual(buttons.map((button) => button.behaviors[0].value), [
   { c: 'call-1', q: 0, o: 0 },
   { c: 'call-1', q: 0, o: 1 },
   { c: 'call-1', q: 0, skip: true },
 ])
+assert.ok(buttons.every((button) => button.width === 'fill'), 'every button must fill the card width')
 assert.ok(elements.some((element) => element.element_id === QA_STATUS_ELEMENT_ID))
-assert.match(row.columns[0].elements[0].text.content, /交互卡片/)
+assert.match(buttons[0].text.content, /交互卡片/)
+assert.equal(elements.some((element) => element.tag === 'column_set'), false)
+// Option descriptions and the reply hint are a notation-sized footnote block.
+const finePrint = elements.find((element) => element.text_size === 'notation' && element.element_id === undefined)
+assert.ok(finePrint, 'fine print block is missing')
+assert.match(finePrint.content, /点击即答/)
+assert.match(finePrint.content, /回复序号/)
 
-// Multi-select adds a 提交 button, and a free-text question has no button row.
+// Multi-select pairs 提交 with 跳过 in the action row, and a free-text question
+// has no buttons at all.
 const multi = questionCardJson({
   callId: 'call-2',
   questions: [{ id: 'tags', question: '选几个', options: [{ label: '甲' }, { label: '乙' }], multiSelect: true }],
 })
-const multiRow = multi.body.elements.find((element) => element.tag === 'column_set')
-const multiValues = multiRow.columns.flatMap((column) => column.elements.map((button) => button.behaviors[0].value))
-assert.ok(multiValues.some((value) => value.submit === true))
+const multiButtons = multi.body.elements.filter((element) => element.tag === 'button')
+assert.deepEqual(multiButtons.map((button) => button.behaviors[0].value), [
+  { c: 'call-2', q: 0, o: 0 },
+  { c: 'call-2', q: 0, o: 1 },
+])
+const actionRow = multi.body.elements.find((element) => element.tag === 'column_set')
+assert.equal(actionRow.columns.length, 2)
+assert.deepEqual(actionRow.columns.map((column) => column.elements[0].text.content), ['提交', '跳过'])
+// A multi-select question mirrors its ticks in a dedicated, patchable element:
+// button text itself cannot be rewritten, and the note alone hides the choice.
+const tickLine = multi.body.elements.find((element) => element.element_id === `${QA_SELECTION_ELEMENT_PREFIX}0`)
+assert.ok(tickLine, 'selection mirror element is missing')
+assert.match(tickLine.content, /已选：无/)
+assert.match(questionSelectionText({ options: [{ label: '甲' }, { label: '乙' }] }, new Set([1])), /已选：乙/)
+assert.match(questionSelectionText({ options: [{ label: '甲' }, { label: '乙' }] }, new Set([1, 0])), /甲、乙/)
 const freeText = questionCardJson({ callId: 'call-3', questions: [{ id: 'name', question: '叫什么？' }] })
-assert.equal(freeText.body.elements.some((element) => element.tag === 'column_set'), false)
+assert.equal(freeText.body.elements.some((element) => element.tag === 'button'), false)
+
+// Element writes only succeed while the card's streaming mode is open.
+assert.equal(card.config.streaming_mode, true)
+
+// A long option list folds its tail into a collapsible panel: three rows stay
+// visible, everything past the third folds.
+const many = questionCardJson({
+  callId: 'call-4',
+  questions: [{ id: 'pick', question: '选一个', options: Array.from({ length: 8 }, (_, at) => ({ label: `选项${at + 1}` })) }],
+})
+const topButtons = many.body.elements.filter((element) => element.tag === 'button')
+assert.equal(topButtons.length, 4) // three options plus 跳过
+const panel = many.body.elements.find((element) => element.tag === 'collapsible_panel')
+assert.ok(panel, 'collapsible panel is missing')
+assert.equal(panel.expanded, false)
+assert.ok(panel.header.title.content.includes('其余 5 项（点击展开 / 收起）'))
+assert.deepEqual(panel.elements.map((button) => button.behaviors[0].value), [
+  { c: 'call-4', q: 0, o: 3 },
+  { c: 'call-4', q: 0, o: 4 },
+  { c: 'call-4', q: 0, o: 5 },
+  { c: 'call-4', q: 0, o: 6 },
+  { c: 'call-4', q: 0, o: 7 },
+])
+
+// The fine print closes the question block instead of splitting it.
+const finePrintIndex = many.body.elements.findIndex((element) => element.text_size === 'notation' && element.element_id === undefined)
+const lastButtonIndex = many.body.elements.map((element) => element.tag === 'button').lastIndexOf(true)
+assert.ok(finePrintIndex > lastButtonIndex, 'fine print must sit below the buttons')
+
+// A stepped card carries the question's batch offset so a click maps back to
+// the right question of the batch.
+const stepped = questionCardJson({
+  callId: 'call-5',
+  offset: 1,
+  title: '第 2/2 题',
+  questions: [{ id: 'second', question: '第二个问题', options: [{ label: '甲' }, { label: '乙' }] }],
+})
+assert.equal(stepped.header.title.content, '第 2/2 题')
+assert.deepEqual(stepped.body.elements.filter((element) => element.tag === 'button').map((button) => button.behaviors[0].value), [
+  { c: 'call-5', q: 1, o: 0 },
+  { c: 'call-5', q: 1, o: 1 },
+  { c: 'call-5', q: 1, skip: true },
+])
 
 // 2. Text replies: index, label (recommendation suffix stripped), custom, skip.
 assert.deepEqual(parseQuestionText('2', questions), [{ id: 'mode', selected: ['纯文本'] }])
@@ -90,6 +155,31 @@ assert.equal(isQuestionComplete(pending), false)
 assert.equal(applyQuestionSelection(pending, { c: 'call-1', q: 0, o: 1 }), true)
 assert.equal(isQuestionComplete(pending), true)
 assert.deepEqual(questionAnswersOf(pending), [{ id: 'mode', selected: ['纯文本'] }])
+
+// A batch is asked one step at a time: settling the first question must not
+// settle the batch.
+const steppedBatch = {
+  callId: 'call-9',
+  questions: [
+    { id: 'first', question: '第一个', options: [{ label: '甲' }, { label: '乙' }] },
+    { id: 'second', question: '第二个', options: [{ label: '丙' }, { label: '丁' }] },
+  ],
+  selections: [new Set(), new Set()],
+  skipped: new Set(),
+  submitted: new Set(),
+  step: 0,
+}
+assert.equal(isStepSettled(steppedBatch, 0), false)
+assert.equal(applyQuestionSelection(steppedBatch, { c: 'call-9', q: 0, o: 1 }), true)
+assert.equal(isStepSettled(steppedBatch, 0), true)
+assert.equal(isQuestionComplete(steppedBatch), false)
+steppedBatch.step = 1
+assert.equal(applyQuestionSelection(steppedBatch, { c: 'call-9', q: 1, o: 0 }), true)
+assert.equal(isQuestionComplete(steppedBatch), true)
+assert.deepEqual(questionAnswersOf(steppedBatch), [
+  { id: 'first', selected: ['乙'] },
+  { id: 'second', selected: ['丙'] },
+])
 
 const multiPending = {
   callId: 'call-2',
