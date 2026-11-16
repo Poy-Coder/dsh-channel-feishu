@@ -78,6 +78,10 @@ export const Config = z.object({
   idleReleaseMinutes: z.number().default(30).description('Minutes of quiet before the plugin hands its agent back; 0 keeps it alive.'),
   notifyOnNew: z.boolean().default(true).description('Reply on the IM when /new creates a session.'),
   streamingCards: z.boolean().default(true).description('Stream answers into a card; off sends plain text.'),
+  textProgressSeconds: z.number().default(30)
+    .description('Channels without editable messages (WeChat): seconds without answer text before one progress message is pushed; 0 disables progress messages. Raise it if 30s feels chatty.'),
+  streamIntervalMs: z.number().default(900)
+    .description('Channels without editable messages (WeChat): refresh interval of the live answer bubble in milliseconds. Larger is gentler on the connection, smaller looks smoother.'),
   autoReply: z.boolean().default(true).description('Deliver each turn\u2019s answer back to the originating chat.'),
   questionCards: z.boolean().default(true).description('Answer ask_user_question in Feishu with an interactive card (buttons plus a text-reply fallback).'),
   questionTimeoutSeconds: z.number().default(600).description('Seconds a question card waits for an answer before it is skipped; 0 waits forever.'),
@@ -89,9 +93,13 @@ export const Config = z.object({
   region: z.union([z.const('feishu'), z.const('lark')]).default('feishu').description('Feishu China or Lark international.'),
   appId: z.string().default('').description('Optional app id; prefer the credentials store or credentials file.'),
   appSecret: z.string().default('').description('Optional app secret; prefer the credentials store or credentials file.'),
+  botToken: z.string().default('').description('WeChat (iLink) bot token; prefer ~/.dsh/wechat-channel.json written by scripts/wechat-login.mjs.'),
+  accountId: z.string().default('').description('WeChat (iLink) bot account id (ilink_bot_id) paired with botToken.'),
+  baseUrl: z.string().default('').description('Transport base URL override (iLink API host for WeChat); empty uses the provider default.'),
   defaultChatId: z.string().default('').description('Destination used when a tool call omits receiveId.'),
   logFile: z.string().default('').description('Inbound diagnostics log path.'),
   readyNotice: z.boolean().default(true).description('Send one "channel ready" message to the default chat after the inbound long connection comes up.'),
+  problemNotices: z.boolean().default(true).description('Push a Feishu note explaining the cause when a turn fails, a message cannot be delivered, or the long connection stays down.'),
   mirrorUserMessages: z.boolean().default(true).description('Post messages typed outside Feishu (desktop GUI) into the owning chat, as "来自桌面端：<text>".'),
   logLevel: z.union([z.const('debug'), z.const('info'), z.const('warn'), z.const('error')])
     .default('info')
@@ -102,6 +110,35 @@ export const Config = z.object({
 
 /** The provider the running channel speaks through; set once in `apply`. */
 let activeProvider
+
+/**
+ * Per-channel identity.
+ *
+ * Two channels (Feishu + WeChat) can run side by side only when everything they
+ * own has its own name: workspace, state/log files, session-title prefix and
+ * tool names. Every user-visible channel name in this package comes from here,
+ * so a WeChat row never has to pretend it is Feishu.
+ */
+const CHANNEL_PROFILES = {
+  feishu: { label: '飞书', fileSlug: 'feishu', workspaceName: 'dsh-feishu', sessionPrefix: '飞书会话', toolPrefix: 'feishu' },
+  wechat: { label: '微信', fileSlug: 'wechat', workspaceName: 'dsh-wechat', sessionPrefix: '微信会话', toolPrefix: 'wechat' },
+}
+
+export function channelProfile(config = {}) {
+  const raw = String(config?.provider ?? '').trim()
+  const id = (raw || 'feishu').toLowerCase()
+  const known = CHANNEL_PROFILES[id]
+  if (known) return { id, ...known }
+  // An unknown provider still gets a stable identity: a filesystem-safe slug for
+  // paths and tool names, and its spelling as the human label.
+  const safe = id.replace(/[^a-z0-9-]/g, '') || 'channel'
+  return { id, label: raw || id, fileSlug: safe, workspaceName: `dsh-${safe}`, sessionPrefix: `${raw || id} 会话`, toolPrefix: safe }
+}
+
+/** DSH home: the directory this channel keeps its state, log and credential files in. */
+function dshHomeDir() {
+  return String(process.env.DSH_HOME ?? '').trim() || join(homedir(), '.dsh')
+}
 
 function provider() {
   if (!activeProvider) throw new Error('channel provider is not initialized')
@@ -621,12 +658,25 @@ export async function finalizeTurn(ctx, config, sessionId, turn, reason) {
   const text = replyText(record).trim()
   const chatId = replyTargetOf(config, sessionId)
   const cardsOn = config.streamingCards !== false
+  const failure = failureTextOf(reason)
 
-  // Nothing but the placeholder: finish the card with a clear note instead of
+  // A turn that failed *after* producing part of an answer still ships that part,
+  // so the failure needs its own line — otherwise the cut-off reads as an ending.
+  if (failure && text) {
+    void notifyProblem(config, {
+      key: `turn:${sessionId}`,
+      title: '这一轮中途出错了',
+      detail: `会话 ${sessionId.slice(0, 22)} 第 ${turn} 轮：${failure}\n`
+        + '上面是出错前已经生成的部分，重发那条消息可以重试。',
+      chatId,
+    })
+  }
+
+  // Nothing but the placeholder: finish the card with the cause instead of
   // leaving a "thinking" card open forever.
   if (!answerTextOf(record).trim()) {
     if (cardsOn && record.card) {
-      const note = reason?.kind === 'error' ? '（这一轮出错了，没有产生回复）' : '（没有产生文字回答）'
+      const note = failure ? `⚠️ 这一轮出错了：${failure}` : '（没有产生文字回答）'
       try {
         record.card.sequence += 1
         await provider().card.update({
@@ -638,16 +688,16 @@ export async function finalizeTurn(ctx, config, sessionId, turn, reason) {
         })
         logInbound(config, {
           event: 'card', result: 'closed', sessionId, turn, cardId: record.card.cardId,
-          chars: 0, updates: record.updates ?? 0, note: 'empty',
+          chars: 0, updates: record.updates ?? 0, note: failure ? 'failed' : 'empty',
         })
         return
       } catch (error) {
         warnTo(ctx, `card close (empty) failed: ${errorText(error)}`)
       }
     }
-    if (reason?.kind === 'error' && chatId) {
+    if (failure && chatId) {
       try {
-        await sendChannelText(config, chatId, '这一轮处理出错了，没有产生回复。')
+        await sendChannelText(config, chatId, `这一轮出错了：${failure}\n重发那条消息可以重试。`)
       } catch { /* best effort */ }
     }
     return
@@ -746,7 +796,7 @@ export async function finalizeTurn(ctx, config, sessionId, turn, reason) {
 
   if (record.sentByTool) {
     logInbound(config, {
-      event: 'reply', result: 'skipped', reason: 'already sent through feishu_send_message', sessionId, turn,
+      event: 'reply', result: 'skipped', reason: `already sent through ${channelProfile(config).toolPrefix}_send_message`, sessionId, turn,
     })
     return
   }
@@ -773,6 +823,9 @@ export function observeSessionEvent(ctx, config, session, event) {
   const data = event?.data ?? {}
   if (event.type === 'turn/start') {
     const record = turnRecord(target, data.turn)
+    // Remember the in-flight turn on disk: if the process dies now, the next
+    // start can tell the chat which answer was lost.
+    writeRuntimeMarker(config, { activeTurn: { sessionId: target, turn: data.turn, at: Date.now() } })
     // Thinking process first (its create round trip overlaps the model's time to
     // first token), then the card placeholder.
     ensureCotRun(ctx, config, target, data.turn)
@@ -781,7 +834,7 @@ export function observeSessionEvent(ctx, config, session, event) {
     return
   }
   if (event.type === 'tool/call') {
-    if (data.name === 'feishu_send_message') turnRecord(target, data.turn).sentByTool = true
+    if (data.name === `${channelProfile(config).toolPrefix}_send_message`) turnRecord(target, data.turn).sentByTool = true
     const record = turnRecord(target, data.turn)
     // The card placeholder names the running tool, so a long tool phase still
     // shows progress instead of a frozen 思考中….
@@ -838,6 +891,7 @@ export function observeSessionEvent(ctx, config, session, event) {
     return
   }
   if (event.type === 'turn/end') {
+    writeRuntimeMarker(config, { activeTurn: undefined })
     finishCotRun(config, target, data.turn, data.reason?.kind === 'error'
       ? (data.reason.error?.message ?? 'turn failed')
       : undefined)
@@ -1044,7 +1098,7 @@ function appendCotReasoning(run, text) {
 }
 
 const sendMessageTool = (config) => ({
-  name: 'feishu_send_message',
+  name: `${channelProfile(config).toolPrefix}_send_message`,
   description:
     'Send a plain-text message through the dedicated DSH Feishu bot (飞书). '
     + 'The channel already delivers the final answer of every Feishu-originated turn back '
@@ -1095,7 +1149,7 @@ const sendMessageTool = (config) => ({
 })
 
 const sendFileTool = (config) => ({
-  name: 'feishu_send_file',
+  name: `${channelProfile(config).toolPrefix}_send_file`,
   description:
     'Upload and send one local file through the Feishu bot: pictures (png/jpg/webp/gif/bmp) go as '
     + 'image messages, everything else (pdf/docx/xlsx/pptx/zip/mp4/text…) as file messages. '
@@ -1180,7 +1234,7 @@ function nextStepsOf(config, result, inbound) {
 }
 
 const statusTool = (config) => ({
-  name: 'feishu_channel_status',
+  name: `${channelProfile(config).toolPrefix}_channel_status`,
   description:
     'Report the DSH Feishu channel state: whether app credentials are present, which region and '
     + 'default destination are configured, and whether a tenant access token can be obtained.',
@@ -1223,24 +1277,30 @@ const statusTool = (config) => ({
       const steps = Array.isArray(value?.nextSteps) && value.nextSteps.length > 0
         ? `\n下一步：\n${value.nextSteps.map((step, index) => `${index + 1}. ${step}`).join('\n')}`
         : ''
+      const profile = channelProfile(config)
+      const isWechat = profile.id === 'wechat'
       if (!value?.configured) {
-        return [{ type: 'text', text: `飞书通道未配置。${value?.error ?? ''}`.trim() + steps }]
+        return [{ type: 'text', text: `${profile.label}通道未配置。${value?.error ?? ''}`.trim() + steps }]
       }
       const head = value.tokenOk
-        ? '飞书通道已配置，tenant_access_token 获取成功。'
-        : `飞书通道已配置，但取 token 失败: ${value.error ?? 'unknown error'}`
+        ? (isWechat
+          ? `${profile.label}通道已配置，bot token 有效。`
+          : `${profile.label}通道已配置，tenant_access_token 获取成功。`)
+        : `${profile.label}通道已配置，但 token 校验失败: ${value.error ?? 'unknown error'}`
       const inbound = value.inboundReady
-        ? '入站长连接：已就绪'
-        : `入站长连接：未就绪${value.inboundError ? `（${value.inboundError}）` : ''}`
+        ? (isWechat ? '入站长轮询：已就绪' : '入站长连接：已就绪')
+        : `${isWechat ? '入站长轮询' : '入站长连接'}：未就绪${value.inboundError ? `（${value.inboundError}）` : ''}`
+      const identity = isWechat
+        ? `账号=${value.accountId || '(none)'} 默认会话=${value.defaultChatId || '(none)'}`
+        : `appId=${value.appId || '(env/file)'} region=${value.region} defaultChatId=${value.defaultChatId || '(none)'}`
       const last = value.lastInboundAt
         ? new Date(value.lastInboundAt).toLocaleString('zh-CN')
         : '(还没收到过)'
       return [{
         type: 'text',
-        text: `${head}\nappId=${value.appId || '(env/file)'} region=${value.region} `
-          + `defaultChatId=${value.defaultChatId || '(none)'}\n${inbound}`
+        text: `${head}\n${identity}\n${inbound}`
           + `\n会话=${value.sessionId || '(none)'} 工作区=${value.workspacePath || '(none)'} `
-          + `自动回传=${value.autoReply ? 'on' : 'off'} 流式卡片=${value.streamingCards ? 'on' : 'off'}`
+          + `自动回传=${value.autoReply ? 'on' : 'off'} ${isWechat ? '分条发送' : '流式卡片'}=${value.streamingCards ? 'on' : 'off'}`
           + `\n最近入站=${last}`
           + `\n流式帧=${value.streamFrames ?? 0} 订阅=${value.streamWatchers ?? 0}`
           + ` 文本块=${value.textChunks ?? 0} 思考块=${value.reasoningChunks ?? 0} 其它=${value.otherChunks ?? 0}`
@@ -1288,6 +1348,10 @@ const statusTool = (config) => ({
       observeEnd: observeStats.end,
       observeChunk: observeStats.chunk,
       version: PLUGIN_VERSION,
+      // The pair that matters after a DSH upgrade: what the plugin claims to
+      // support, and what it is actually running on.
+      dshVersion: dshRuntimeVersion(),
+      dshRange: PLUGIN_DSH_RANGE,
     }
     return { ...state, nextSteps: nextStepsOf(config, state, inbound) }
   },
@@ -1316,18 +1380,18 @@ const PACKAGE_DIR = dirname(fileURLToPath(import.meta.url))
  * Dedicated workspace for channel-created sessions, so they show up under their
  * own group in the GUI's workspace list instead of polluting a personal one.
  */
-const DEFAULT_WORKSPACE_TITLE = '飞书'
-
 /**
- * Default workspace directory.
+ * Dedicated workspace for channel-created sessions, so they show up under their
+ * own group in the GUI's workspace list instead of polluting a personal one.
  *
- * Never silently lands on the Windows system drive: prefer the drive the app is
- * installed on, then any other fixed drive, and only fall back to the user's home
- * when no non-system drive exists. `workspacePath` in the row config always wins.
+ * The name comes from the channel profile: Feishu sessions group under 飞书,
+ * WeChat sessions under 微信, and the two never share a directory unless the row
+ * config points them at the same `workspacePath`.
  */
-function defaultWorkspacePath() {
+function defaultWorkspacePath(config) {
+  const dirName = channelProfile(config).fileSlug
   const home = homedir()
-  if (process.platform !== 'win32') return join(home, 'dsh-feishu')
+  if (process.platform !== 'win32') return join(home, 'dsh', dirName)
   const systemDrive = String(process.env.SystemDrive ?? 'C:').trim().toLowerCase()
   const installDrive = (() => {
     const dir = String(process.env.DSH_INSTALL_DIR ?? '').trim()
@@ -1339,15 +1403,15 @@ function defaultWorkspacePath() {
     if (!root) continue
     if (root.toLowerCase() === `${systemDrive}\\`) continue
     try {
-      if (existsSync(root)) return join(root, 'dsh-feishu')
+      if (existsSync(root)) return join(root, 'dsh', dirName)
     } catch { /* unreadable drive, try the next one */ }
   }
-  return join(home, 'dsh-feishu')
+  return join(home, 'dsh', dirName)
 }
 
 /** Directory a channel-created session uses as cwd. */
 export function workspacePathFor(config) {
-  return String(config?.workspacePath ?? '').trim() || defaultWorkspacePath()
+  return String(config?.workspacePath ?? '').trim() || defaultWorkspacePath(config)
 }
 
 /** Directory used when `sessionMode` has to create a session. */
@@ -1386,7 +1450,7 @@ export async function attachToFeishuWorkspace(ctx, config, sessionId) {
       workspace = (registry.list() ?? []).find((entry) => normalizePath(entry?.path) === wanted)
     }
     if (!workspace) {
-      workspace = await registry.create(path, DEFAULT_WORKSPACE_TITLE)
+      workspace = await registry.create(path, channelProfile(config).label)
       logInbound(config, { event: 'workspace', result: 'created', path })
     }
     if (typeof workspace?.attachSession !== 'function') {
@@ -1510,6 +1574,12 @@ export async function ensureSessionTitle(ctx, config, session, text) {
 const IDLE_RELEASE_CHECK_MS = 60_000
 const IDLE_PROBE_MS = 2_000
 
+/** How long a dropped long connection may stay down before the chat is told. */
+const CONNECTION_DOWN_NOTICE_MS = 20_000
+
+/** How often the loaded plugin refreshes its runtime marker for the watchdog. */
+const RUNTIME_HEARTBEAT_MS = 5 * 60_000
+
 /** The one plugin-owned live agent, activated on demand for the inbound session. */
 let ownedHandle
 let lastInboundAt = 0
@@ -1526,14 +1596,112 @@ function setInboundState(config, next) {
   logInbound(config, { event: 'channel', ...next })
 }
 
-/** Version of the running package, shown in the status tool and the ready notice. */
-const PLUGIN_VERSION = (() => {
+/** The running package's manifest: version, and the dsh releases it was verified on. */
+export const PLUGIN_MANIFEST = (() => {
   try {
-    return String(JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version ?? '')
+    return JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'))
   } catch {
-    return ''
+    return {}
   }
 })()
+
+/** Version of the running package, shown in the status tool and the ready notice. */
+const PLUGIN_VERSION = String(PLUGIN_MANIFEST.version ?? '')
+
+/** `engines.dsh` of this build: the range Plugin Manager enforces before loading it. */
+const PLUGIN_DSH_RANGE = String(PLUGIN_MANIFEST.engines?.dsh ?? '')
+
+/** Parse `1.2.3` / `1.2.3-rc.4` into comparable parts; undefined for anything else. */
+export function parseSemver(text) {
+  const match = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/.exec(String(text ?? '').trim())
+  if (!match) return undefined
+  return {
+    major: Number(match[1]),
+    minor: Number(match[2]),
+    patch: Number(match[3]),
+    prerelease: match[4] ? match[4].split('.') : [],
+  }
+}
+
+/**
+ * Semver precedence, the one rule the runtime check needs: numbers first, then a
+ * release outranks its prereleases, then identifiers by semver 11's rules.
+ */
+export function compareSemver(left, right) {
+  const a = parseSemver(left)
+  const b = parseSemver(right)
+  if (!a || !b) return undefined
+  for (const key of ['major', 'minor', 'patch']) {
+    if (a[key] !== b[key]) return a[key] < b[key] ? -1 : 1
+  }
+  if (a.prerelease.length === 0 && b.prerelease.length === 0) return 0
+  if (a.prerelease.length === 0) return 1
+  if (b.prerelease.length === 0) return -1
+  const length = Math.max(a.prerelease.length, b.prerelease.length)
+  for (let at = 0; at < length; at += 1) {
+    const x = a.prerelease[at]
+    const y = b.prerelease[at]
+    if (x === undefined) return -1
+    if (y === undefined) return 1
+    if (x === y) continue
+    const numericX = /^\d+$/.test(x)
+    const numericY = /^\d+$/.test(y)
+    if (numericX && numericY) return Number(x) < Number(y) ? -1 : 1
+    if (numericX) return -1
+    if (numericY) return 1
+    return x < y ? -1 : 1
+  }
+  return 0
+}
+
+/**
+ * Test one version against a space-separated comparator range (`>=1.2.3 <2.0.0`).
+ * DSH evaluates `engines.dsh` with prereleases included; this follows the same
+ * order, so the self-check agrees with the gate that let the plugin load.
+ */
+export function versionSatisfies(version, range) {
+  if (!parseSemver(version)) return false
+  const comparators = String(range ?? '').trim().split(/\s+/).filter(Boolean)
+  if (comparators.length === 0) return false
+  for (const comparator of comparators) {
+    const match = /^(>=|<=|>|<|=)?(.+)$/.exec(comparator)
+    if (!match) return false
+    const order = compareSemver(version, match[2])
+    if (order === undefined) return false
+    const operator = match[1] ?? '='
+    if (operator === '>=' && order < 0) return false
+    if (operator === '>' && order <= 0) return false
+    if (operator === '<=' && order > 0) return false
+    if (operator === '<' && order >= 0) return false
+    if (operator === '=' && order !== 0) return false
+  }
+  return true
+}
+
+/**
+ * Version of the dsh runtime the plugin is loaded into.
+ *
+ * The host advertises its CLI package through `DSH_INSTALL_DIR`; a Desktop main
+ * process also exposes the asar path through `process.resourcesPath`. Neither is
+ * guaranteed, so both are tried and an unreadable runtime reports ''.
+ */
+export function dshRuntimeVersion() {
+  const candidates = []
+  const installDir = String(process.env.DSH_INSTALL_DIR ?? '').trim()
+  if (installDir) candidates.push(join(installDir, 'package.json'))
+  const resources = String(process.resourcesPath ?? '').trim()
+  if (resources) {
+    candidates.push(join(resources, 'app.asar', 'dsh', 'node_modules', '@deepseek-ai', 'dsh', 'package.json'))
+  }
+  for (const path of candidates) {
+    try {
+      const manifest = JSON.parse(readFileSync(path, 'utf8'))
+      const version = String(manifest?.version ?? '').trim()
+      if (parseSemver(version)) return version
+    } catch { /* try the next candidate */ }
+  }
+  return ''
+}
 
 let readyAnnounced = false
 
@@ -1559,6 +1727,81 @@ async function mirrorUserMessage(config, sessionId, text, surface = '桌面端')
   }
 }
 
+/** How often the same kind of problem may be pushed into the chat. */
+const PROBLEM_NOTICE_MIN_MS = 60_000
+const problemNoticedAt = new Map()
+
+/**
+ * Push one problem notice to the chat, at most once a minute per key.
+ *
+ * A silent failure is the failure the user cannot act on: a turn that dies, a
+ * message that never lands, a long connection that stays down. The notice names
+ * the cause and where to look; the caller still gets a boolean so it can decide
+ * what to do with the card.
+ */
+async function notifyProblem(config, { key, title, detail, chatId }) {
+  if (config?.problemNotices === false) return false
+  const now = Date.now()
+  if (now - (problemNoticedAt.get(key) ?? 0) < PROBLEM_NOTICE_MIN_MS) return false
+  let target = String(chatId ?? '').trim()
+  if (!target) {
+    try { target = String(provider().settings().defaultChatId ?? '').trim() } catch { target = '' }
+  }
+  if (!target) return false
+  problemNoticedAt.set(key, now)
+  const lines = [`⚠️ ${channelProfile(config).label}通道：${title}`]
+  if (detail) lines.push(String(detail).trim())
+  lines.push(`日志：${inboundLogPath(config)}`)
+  try {
+    await provider().sendText({ chatId: target, text: lines.join('\n') })
+    logInbound(config, { event: 'problem', result: 'notified', key })
+    return true
+  } catch (error) {
+    logInbound(config, { event: 'problem', result: 'notify-failed', key, reason: errorText(error) })
+    return false
+  }
+}
+
+/**
+ * Explain, on the next start, that the previous run died mid-turn.
+ *
+ * A process killed while an answer was streaming leaves `activeTurn` in the
+ * runtime marker; without this the user only sees that the reply never came.
+ */
+async function reportPreviousCrash(config, previous) {
+  const active = previous?.activeTurn
+  if (!previous || previous.clean === true || !active) return false
+  const sessionId = String(active.sessionId ?? '')
+  const turn = Number(active.turn)
+  const at = Number(active.at ?? previous.updatedAt ?? 0)
+  const stamp = at ? new Date(at).toLocaleString('zh-CN', { hour12: false }) : ''
+  return await notifyProblem(config, {
+    key: 'crash',
+    title: '上次运行在半途退出了',
+    detail: `会话 ${sessionId.slice(0, 22)}${Number.isFinite(turn) ? ` 第 ${turn} 轮` : ''} 没跑完`
+      + `${stamp ? `（最后活动 ${stamp}）` : ''}，可能是崩溃或被强制结束。\n那一轮的回复不会自己补上，把消息重发一次即可继续。`,
+  })
+}
+
+/**
+ * Say once that this build is running outside its declared dsh range.
+ *
+ * Plugin Manager blocks such a load, so reaching here means the user granted an
+ * exact-version exemption (or the row bypasses the gate). Saying it in the chat
+ * turns "why is the channel acting up after the upgrade" into a known cause.
+ */
+async function reportRuntimeMismatch(config) {
+  const runtime = dshRuntimeVersion()
+  if (!runtime || !PLUGIN_DSH_RANGE) return false
+  if (versionSatisfies(runtime, PLUGIN_DSH_RANGE)) return false
+  return await notifyProblem(config, {
+    key: 'runtime-mismatch',
+    title: '插件和这版 DSH 不匹配',
+    detail: `插件 v${PLUGIN_VERSION || '?'} 声明支持 dsh ${PLUGIN_DSH_RANGE}，当前运行的是 ${runtime}。\n`
+      + '它能加载说明给了版本豁免；行为可能异常，建议更新插件到支持这版 DSH 的版本。',
+  })
+}
+
 /**
  * One "channel ready" message per process.
  *
@@ -1572,11 +1815,15 @@ async function announceReady(config) {
   try {
     const chatId = String(provider().settings().defaultChatId ?? '').trim()
     if (!chatId) return
-    const session = String(config?.sessionId ?? '').trim()
+    // Name the session inbound messages actually land in. The row config keeps
+    // pinning its own id, so after `/new` (or after a config reload) printing that
+    // pin reads as if the channel had switched to — or created — another session.
+    const session = currentSessionId(config)
     await provider().sendText({
       chatId,
-      text: `✅ 飞书通道已就绪\n插件 dsh-channel-feishu v${PLUGIN_VERSION || '(unknown)'}\n`
-        + `入站长连接正常，接收会话=${session || '按消息新建'}`,
+      text: `✅ ${channelProfile(config).label}通道已就绪\n插件 ${PLUGIN_MANIFEST.name ?? 'dsh-channel'} v${PLUGIN_VERSION || '(unknown)'}`
+        + ` · DSH ${dshRuntimeVersion() || '(unknown)'}\n`
+        + `入站长连接正常，当前会话=${session || '按消息新建'}`,
     })
     logInbound(config, { event: 'channel', result: 'ready-notice', chatId })
   } catch (error) {
@@ -1588,7 +1835,7 @@ const errorText = (error) => (error instanceof Error ? error.message : String(er
 
 /** Inbound diagnostics land next to the credentials unless `logFile` says otherwise. */
 function inboundLogPath(config) {
-  return String(config.logFile ?? '').trim() || join(dirname(credentialsFilePath()), 'feishu-inbound.log')
+  return String(config.logFile ?? '').trim() || join(dshHomeDir(), `${channelProfile(config).fileSlug}-inbound.log`)
 }
 
 const LOG_RANK = { debug: 10, info: 20, warn: 30, error: 40 }
@@ -1810,7 +2057,7 @@ export async function releaseOwnedAgentIfIdle(config) {
 /** Where the channel remembers which conversation `/new` switched to. */
 function channelStatePath(config) {
   return String(config.stateFile ?? '').trim()
-    || join(dirname(credentialsFilePath()), 'feishu-channel-state.json')
+    || join(dshHomeDir(), `${channelProfile(config).fileSlug}-channel-state.json`)
 }
 
 function readChannelState(config) {
@@ -1847,6 +2094,55 @@ function writeChannelState(config, patch) {
     logInbound(config, { event: 'session', result: 'state-write-failed', reason: errorText(error) })
     return false
   }
+}
+
+/**
+ * Crash marker: `<home>/feishu-channel-runtime.json`.
+ *
+ * A clean unload marks it; a killed process leaves its in-flight turn behind, and
+ * the next start can then say why the last answer never arrived. Only a run that
+ * died *during* a turn earns a notice: forcing DSH down on an idle channel is a
+ * normal operation here, and warning about it would be noise.
+ */
+function runtimeMarkerPath(config) {
+  try { return join(dirname(channelStatePath(config)), `${channelProfile(config).fileSlug}-channel-runtime.json`) } catch { return '' }
+}
+
+export function readRuntimeMarker(config) {
+  const path = runtimeMarkerPath(config)
+  if (!path) return undefined
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf8'))
+    return parsed && typeof parsed === 'object' ? parsed : undefined
+  } catch {
+    return undefined
+  }
+}
+
+export function writeRuntimeMarker(config, patch) {
+  const path = runtimeMarkerPath(config)
+  if (!path) return false
+  try {
+    const next = { ...(readRuntimeMarker(config) ?? {}), ...patch, updatedAt: Date.now() }
+    writeFileSync(path, `${JSON.stringify(next, null, 2)}\n`)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * One line describing why a turn failed, for both the card note and the chat
+ * notice. DSH hands `turn/end` a reason such as
+ * `{ kind: 'error', error: { message, code } }`; anything else is not a failure.
+ */
+export function failureTextOf(reason) {
+  if (!reason || reason.kind !== 'error') return ''
+  const error = reason.error ?? reason
+  const message = String(error?.message ?? error?.detail ?? reason?.message ?? '').trim()
+  const code = String(error?.code ?? '').trim()
+  const text = message || (code ? `错误码 ${code}` : '没有给出原因')
+  return text.length > 300 ? `${text.slice(0, 300)}…` : text
 }
 
 /** The conversation inbound messages go to: the `/new` state first, then the row config. */
@@ -1931,7 +2227,7 @@ async function switchToNewSession(ctx, config, { chatId, senderId, firstMessage 
   // the app's session list, which is what "/new did nothing" looked like.
   try {
     const stamp = new Date().toLocaleString('zh-CN', { hour12: false }).replace(/\//g, '-')
-    await ensureSessionTitle(ctx, config, handle.agent.session, `飞书会话 ${stamp}`)
+    await ensureSessionTitle(ctx, config, handle.agent.session, `${channelProfile(config).sessionPrefix} ${stamp}`)
   } catch (error) {
     warnTo(ctx, `session title failed: ${errorText(error)}`)
   }
@@ -2240,8 +2536,10 @@ export async function handleInboundEvent(ctx, config, data, seen) {
   }
 
   // This channel is one conversation per bot: a group brings several speakers
-  // into one session, which the current design does not model.
-  if (inbound.chatType && inbound.chatType !== 'p2p') {
+  // into one session, which the current design does not model. Feishu calls a
+  // direct chat `p2p`, WeChat calls it `single`; anything else is a group.
+  const directChat = !inbound.chatType || inbound.chatType === 'p2p' || inbound.chatType === 'single'
+  if (!directChat) {
     log({
       event: 'inbound', result: 'dropped',
       reason: `chat_type=${inbound.chatType} (group chat is not supported)`,
@@ -2427,8 +2725,17 @@ export async function handleInboundEvent(ctx, config, data, seen) {
         .catch((error) => log({ event: 'reaction', result: 'failed', reason: errorText(error) }))
     }
   } catch (error) {
-    warnTo(ctx, `inbound delivery failed for session "${sessionId}": ${errorText(error)}`)
-    log({ event: 'inbound', result: 'error', reason: errorText(error), senderId, chatId, sessionId, via: resolved.via })
+    const reason = errorText(error)
+    warnTo(ctx, `inbound delivery failed for session "${sessionId}": ${reason}`)
+    log({ event: 'inbound', result: 'error', reason, senderId, chatId, sessionId, via: resolved.via })
+    // The message never reached the session: without this the chat just looks
+    // ignored. Name the cause and the way out.
+    void notifyProblem(config, {
+      key: `deliver:${sessionId}`,
+      title: '消息没有投递到会话',
+      detail: `原因：${reason}\n可以重发一次；连续失败就发 /new 换一段新会话。`,
+      chatId,
+    })
     if (resolved.created) await attachToFeishuWorkspace(ctx, config, sessionId)
     return
   }
@@ -2544,37 +2851,40 @@ function fillRow(children) {
   }
 }
 
-/** Option rows shown before the rest fold into a collapsible panel. */
-const OPTION_ROWS_VISIBLE = 3
+/** Number-tagged chips per row: enough to stay tappable on a phone. */
+const CHIPS_PER_ROW = 4
 
-/** A folded group the client expands in place, with no server round trip. */
-function collapsibleGroup(title, elements) {
-  return {
-    tag: 'collapsible_panel',
-    expanded: false,
-    header: {
-      title: { tag: 'markdown', content: title },
-      vertical_align: 'center',
-      icon: { tag: 'standard_icon', token: 'down-small-ccm_outlined', size: '16px 16px' },
-      icon_position: 'right',
-      icon_expanded_angle: -180,
-    },
-    elements,
-  }
+/**
+ * One compact numbered chip per option, queued in rows.
+ *
+ * Option labels never live in a button: a button's text is a single line that the
+ * client cuts with an ellipsis, so a long option lost its tail. The labels sit in
+ * the markdown above instead, and a chip carries only the number printed next to
+ * its label — small target, full-width text, no repeated 「选择」 column.
+ */
+function optionChips({ callId, questionIndex, options }) {
+  const chips = options.map((option, optionIndex) => ({
+    tag: 'button',
+    text: { tag: 'plain_text', content: String(optionIndex + 1) },
+    type: 'default',
+    behaviors: [{ type: 'callback', value: { c: callId, q: questionIndex, o: optionIndex } }],
+  }))
+  const rows = []
+  for (let at = 0; at < chips.length; at += CHIPS_PER_ROW) rows.push(chips.slice(at, at + CHIPS_PER_ROW))
+  return rows.map((row) => fillRow(row))
 }
 
 /**
  * Build the interactive question card (schema 2.0).
  *
- * Every option becomes a callback button whose value carries the call id and
- * the (question, option) indexes, so a click needs no server-side lookup by
- * button text. Options are queued one per row as bare fill-width buttons:
- * a row of auto-width buttons squeezes every label to an ellipsis on mobile,
- * and side-by-side options are hard to hit. Only the 提交 / 跳过 pair shares a
- * row. Option descriptions and the reply hint drop to notation size, and an
- * option list longer than OPTION_ROWS_VISIBLE folds its tail into a collapsible
- * panel. A multi-select question also gets an explicit 提交 button; a free-text
- * question relies on the reply fallback.
+ * Every option becomes a callback chip whose value carries the call id and the
+ * (question, option) indexes, so a click needs no server-side lookup by button
+ * text. Option labels are markdown (they wrap to the full card width) and the
+ * chips queue below them as plain numbers — a button label is a single line the
+ * client ellipsizes, so long options must never live in one. 提交 / 补充 / 跳过
+ * share the action row; 补充 arms the free-text fallback when no option fits.
+ * A multi-select question keeps a patchable tick line above its 提交 button; a
+ * free-text question relies on the reply fallback.
  */
 export function questionCardJson({ callId, questions, selections, skipped, note, answered, offset = 0, title }) {
   const elements = []
@@ -2597,31 +2907,15 @@ export function questionCardJson({ callId, questions, selections, skipped, note,
       return
     }
 
-    // One bare button per option: a top-level button is always its own block,
-    // so the options queue vertically instead of sharing a squeezed row.
-    const buttons = options.map((option, optionIndex) => {
-      const chosen = selections?.[index]?.has?.(optionIndex) === true
-      const label = String(option?.label ?? '').trim().slice(0, 40) || `选项${optionIndex + 1}`
-      return {
-        tag: 'button',
-        width: 'fill',
-        text: { tag: 'plain_text', content: `${optionIndex + 1}. ${label}${chosen ? ' ✓' : ''}` },
-        type: optionIndex === 0 ? 'primary' : 'default',
-        behaviors: [{ type: 'callback', value: { c: callId, q: offset + index, o: optionIndex } }],
-      }
-    })
-    elements.push(...buttons.slice(0, OPTION_ROWS_VISIBLE))
-    if (buttons.length > OPTION_ROWS_VISIBLE) {
-      // A long option list would push the question off the screen; fold the
-      // tail into a panel the client expands without a server round trip. The
-      // panel title stays neutral because the toggle never calls back, so the
-      // channel cannot rewrite it to 收起 after an expansion.
-      elements.push(collapsibleGroup(`其余 ${buttons.length - OPTION_ROWS_VISIBLE} 项（点击展开 / 收起）`, buttons.slice(OPTION_ROWS_VISIBLE)))
-    }
+    // The labels are markdown so they wrap; the chips below carry only numbers.
+    const labels = options.map((option, optionIndex) =>
+      `**${optionIndex + 1}**  ${String(option?.label ?? '').trim() || `选项${optionIndex + 1}`}`)
+    elements.push({ tag: 'markdown', content: labels.join('\n\n') })
+    elements.push(...optionChips({ callId, questionIndex: offset + index, options }))
 
-    // Multi-select ticks are invisible on the buttons themselves (a button's
-    // text cannot be patched), so the card carries one status line per
-    // multi-select question and the channel rewrites it on every click.
+    // Multi-select ticks are invisible on the chips themselves (a button's text
+    // cannot be patched), so the card carries one status line per multi-select
+    // question and the channel rewrites it on every click.
     if (multi) {
       elements.push({
         tag: 'markdown',
@@ -2639,17 +2933,16 @@ export function questionCardJson({ callId, questions, selections, skipped, note,
       finePrint.push(`<font color="grey">${optionIndex + 1} · ${option.description}</font>`)
     })
     finePrint.push(`<font color="grey">${multi
-      ? '可多选：点选项切换选中，选好后点「提交」。'
-      : '点上面的按钮作答，也可直接回复序号 / 选项文字。'}</font>`)
+      ? '可多选：点数字切换选中，选好后点「提交」。都不合适就点「补充」再回复文字。'
+      : '点数字作答，也可直接回复序号 / 选项文字；都不合适就点「补充」再回复文字。'}</font>`)
     elements.push({ tag: 'markdown', text_size: 'notation', content: finePrint.join('\n') })
 
-    // The action row closes the block, so 提交 / 跳过 always sit at the very
-    // bottom no matter how many options the fold reveals.
+    // The action row closes the block, so 提交 / 补充 / 跳过 always sit at the very
+    // bottom no matter how long the option list is.
     const actions = []
     if (multi) {
       actions.push({
         tag: 'button',
-        width: 'fill',
         text: { tag: 'plain_text', content: '提交' },
         type: 'primary',
         behaviors: [{ type: 'callback', value: { c: callId, q: offset + index, submit: true } }],
@@ -2658,7 +2951,12 @@ export function questionCardJson({ callId, questions, selections, skipped, note,
     if (answered !== true) {
       actions.push({
         tag: 'button',
-        width: 'fill',
+        text: { tag: 'plain_text', content: '补充' },
+        type: 'default',
+        behaviors: [{ type: 'callback', value: { c: callId, q: offset + index, other: true } }],
+      })
+      actions.push({
+        tag: 'button',
         text: { tag: 'plain_text', content: '跳过' },
         type: 'default',
         behaviors: [{ type: 'callback', value: { c: callId, q: offset + index, skip: true } }],
@@ -2698,6 +2996,13 @@ export function questionCardJson({ callId, questions, selections, skipped, note,
 }
 
 /** Plain-text fallback used when the card cannot be sent at all. */
+/**
+ * The question as plain text, for a channel that has no cards.
+ *
+ * It has to read like something a person wrote, not like a form: numbered
+ * options, then one sentence that says both ways to answer (a number, or just
+ * type it). No prefixes, no commands, nothing to learn.
+ */
 function questionText(questions) {
   const lines = ['需要你的回答：']
   questions.forEach((question, index) => {
@@ -2707,7 +3012,9 @@ function questionText(questions) {
     question.options.forEach((option, optionIndex) => {
       lines.push(`${optionIndex + 1}. ${option.label}${option.description ? ` — ${option.description}` : ''}`)
     })
-    if (question.options.length === 0) lines.push('直接回复文字作为答案。')
+    lines.push(question.options.length === 0
+      ? '直接回复文字作为答案；回「跳过」不作答。'
+      : '回数字选一个；选项都不合适，就直接打字补充；回「跳过」不作答。')
   })
   return lines.join('\n')
 }
@@ -2718,8 +3025,12 @@ function questionText(questions) {
  * Returns null when the text is not an answer for this question (an unrelated
  * message must be delivered normally, not swallowed). Only a single-question
  * batch is supported through text; multi-question batches need the buttons.
+ *
+ * `allowCustom` is for channels without buttons (WeChat): there the prompt is
+ * plain text, so the number picks an option and any other message is the
+ * supplement — the user must not be taught a protocol before answering.
  */
-export function parseQuestionText(text, questions) {
+export function parseQuestionText(text, questions, { allowCustom = false } = {}) {
   if (!Array.isArray(questions) || questions.length !== 1) return null
   const question = questions[0]
   const raw = String(text ?? '').trim()
@@ -2734,6 +3045,7 @@ export function parseQuestionText(text, questions) {
   }
   const match = options.findIndex((option) => sameLabel(option.label, raw))
   if (match >= 0) return [{ id, selected: [options[match].label] }]
+  if (allowCustom) return [{ id, selected: [], custom: raw }]
   return null
 }
 
@@ -2747,6 +3059,16 @@ export function applyQuestionSelection(pending, value) {
   if (!Number.isInteger(index) || index < 0 || index >= pending.questions.length) return false
   const question = pending.questions[index]
   const options = question.options
+  // 补充 arms the free-text path for this step; a second tap disarms it.
+  if (value.other === true) {
+    pending.otherArmed = pending.otherArmed ?? new Set()
+    if (pending.otherArmed.has(index)) pending.otherArmed.delete(index)
+    else pending.otherArmed.add(index)
+    return true
+  }
+  // Any other deliberate action takes the question out of "waiting for a
+  // supplement", otherwise a later unrelated message would be eaten as one.
+  pending.otherArmed?.delete(index)
   if (value.skip === true) {
     pending.skipped.add(index)
     pending.submitted.add(index)
@@ -2816,9 +3138,11 @@ async function refreshQuestionCard(config, pending, status, answers) {
       ? '等待超时，已跳过。'
       : status === 'skipped'
         ? '已跳过。'
-        : status === 'aborted'
-          ? '已取消。'
-          : '等待你的回答…'
+        : status === 'supplement'
+          ? '等你补充：直接回复文字即可（再点「补充」可取消）。'
+          : status === 'aborted'
+            ? '已取消。'
+            : '等待你的回答…'
   if (!summary) return
   // One card carries exactly one step, so only that step's elements exist to
   // rewrite: its multi-select tick line (when it has options) and the status line.
@@ -2905,7 +3229,9 @@ async function advanceQuestionCard(ctx, config, pending) {
       .sort((left, right) => left - right)
       .map((at) => question.options[at]?.label ?? '')
       .filter(Boolean)
-    const settled = [{ id: question.id, selected }]
+    const settled = [pending.customs?.[index]
+      ? { id: question.id, selected: [], custom: pending.customs[index] }
+      : { id: question.id, selected }]
     await refreshQuestionCard(config, pending, 'answered', settled)
     await closeQuestionCard(config, pending, 'answered', settled)
     pending.step = index + 1
@@ -3048,6 +3374,7 @@ export async function answerUserQuestion(ctx, config, request, next) {
     selections: questions.map(() => new Set()),
     skipped: new Set(),
     submitted: new Set(),
+    otherArmed: new Set(),
     customs: {},
     step: 0,
     timeoutMs,
@@ -3132,6 +3459,16 @@ export async function handleQuestionCardAction(ctx, config, raw) {
     })
     return { toast: { type: 'error', content: '无法识别的选择。' } }
   }
+  if (action.value.other === true) {
+    const armed = pending.otherArmed?.has(pending.step) === true
+    void refreshQuestionCard(config, pending, armed ? 'supplement' : 'waiting')
+    return {
+      toast: {
+        type: 'info',
+        content: armed ? '已开启补充：直接回复文字即可。' : '已取消补充，点数字继续选择。',
+      },
+    }
+  }
   if (isStepSettled(pending, pending.step)) {
     if (pending.step + 1 < pending.questions.length) {
       // Queue the next question as its own card once this one is answered.
@@ -3156,13 +3493,27 @@ export function consumeQuestionTextAnswer(ctx, config, { chatId, senderId, text 
   if (pending.advancing === true) return false
   const index = pending.step ?? 0
   const question = pending.questions[index]
-  const answers = parseQuestionText(text, [question])
-  if (!answers) return false
+  // Channels without buttons (WeChat) take any unmatched message as the
+  // supplement; a card channel keeps the explicit 「补充」 button instead.
+  const allowCustom = provider().freeTextAnswers === true
+  const parsed = parseQuestionText(text, [question], { allowCustom })
+  // 补充: after 「补充」 the next message is the answer verbatim, even though the
+  // question has options that the text does not match.
+  const supplement = parsed === null && pending.otherArmed?.has(index) === true
+  if (!parsed && !supplement) return false
   lastInboundAt = Date.now()
-  recordTextAnswer(pending, index, answers[0])
+  if (parsed) {
+    recordTextAnswer(pending, index, parsed[0])
+  } else {
+    pending.selections[index] = new Set()
+    pending.submitted.add(index)
+    pending.customs = pending.customs ?? {}
+    pending.customs[index] = String(text).trim()
+    pending.otherArmed?.delete(index)
+  }
   logInbound(config, {
-    event: 'question', result: 'answered', via: 'text', sessionId: pending.sessionId,
-    callId: pending.callId, senderId, chatId, step: index,
+    event: 'question', result: 'answered', via: supplement ? 'supplement' : 'text',
+    sessionId: pending.sessionId, callId: pending.callId, senderId, chatId, step: index,
   })
   if (index + 1 < pending.questions.length) {
     void advanceQuestionCard(ctx, config, pending)
@@ -3234,22 +3585,64 @@ function startInbound(ctx, config) {
       releaseTimer.unref?.()
 
       let connectionCleanup = () => {}
+      // A connection that stays down is a silent channel: a normal reconnect lands
+      // in seconds, so wait a moment and only then explain what happened.
+      let connectionDownAt = 0
+      let connectionDownTimer
+      const clearConnectionWatch = () => {
+        if (connectionDownTimer) clearTimeout(connectionDownTimer)
+        connectionDownTimer = undefined
+      }
       void (async () => {
         const cleanup = await provider().connect({
           onEvent: async (data) => {
             try {
               await handleInboundEvent(scoped, config, data, seen)
             } catch (error) {
-              warnTo(scoped, `inbound handler failed: ${error instanceof Error ? error.message : String(error)}`)
+              const text = errorText(error)
+              warnTo(scoped, `inbound handler failed: ${text}`)
+              void notifyProblem(config, { key: 'inbound-handler', title: '处理入站消息时出错', detail: text })
             }
           },
-          onCardAction: async (data) => await handleQuestionCardAction(scoped, config, data),
+          onCardAction: async (data) => {
+            try {
+              return await handleQuestionCardAction(scoped, config, data)
+            } catch (error) {
+              void notifyProblem(config, { key: 'card-action', title: '处理卡片点击时出错', detail: errorText(error) })
+              return { toast: { type: 'error', content: '处理失败，直接回复文字作答即可。' } }
+            }
+          },
           onState: ({ ready, error }) => {
             setInboundState(config, { ready: Boolean(ready), transport: 'websocket', error: String(error ?? '') })
             if (ready) {
+              const downAt = connectionDownAt
+              connectionDownAt = 0
+              clearConnectionWatch()
               warnTo(scoped, 'inbound long connection ready')
+              if (downAt && !disposed) {
+                const seconds = Math.max(1, Math.round((Date.now() - downAt) / 1000))
+                void notifyProblem(config, {
+                  key: 'connection-up',
+                  title: `${channelProfile(config).label}长连接已恢复`,
+                  detail: `断开约 ${seconds} 秒后自动重连成功；这期间发来的消息可能没收到。`,
+                })
+              }
               void announceReady(config)
-            } else if (error && error !== 'closed') warnTo(scoped, `inbound connection problem: ${error}`)
+              return
+            }
+            if (disposed) return
+            if (!connectionDownAt) connectionDownAt = Date.now()
+            if (error && error !== 'closed') warnTo(scoped, `inbound connection problem: ${error}`)
+            if (connectionDownTimer) return
+            connectionDownTimer = setTimeout(() => {
+              connectionDownTimer = undefined
+              void notifyProblem(config, {
+                key: 'connection-down',
+                title: `${channelProfile(config).label}长连接断开`,
+                detail: `原因：${String(error || 'unknown')}\n正在自动重连；恢复后会再报一次。`,
+              })
+            }, CONNECTION_DOWN_NOTICE_MS)
+            connectionDownTimer.unref?.()
           },
         })
         if (disposed) {
@@ -3262,6 +3655,7 @@ function startInbound(ctx, config) {
       return () => {
         disposed = true
         clearInterval(releaseTimer)
+        clearConnectionWatch()
         try { offSessionEvent?.() } catch { /* ignore */ }
         try { offInbox?.() } catch { /* ignore */ }
         try { offQuestion?.() } catch { /* ignore */ }
@@ -3285,9 +3679,32 @@ export function apply(ctx, config = {}) {
     log: (record) => logInbound(config, record),
     credentials: typeof ctx.get === 'function' ? ctx.get('credentials') : undefined,
   })
+  const previousRun = readRuntimeMarker(config)
+  const runtimeVersion = dshRuntimeVersion()
+  // Heartbeat: a run that stops updating this marker is a run that died — the
+  // watchdog outside DSH reads exactly this to tell "plugin not loaded" from
+  // "plugin idle", including after a DSH upgrade silently dropped it.
+  const heartbeat = () => writeRuntimeMarker(config, {
+    clean: false,
+    pid: process.pid,
+    pluginVersion: PLUGIN_VERSION,
+    dshVersion: runtimeVersion,
+    heartbeatAt: Date.now(),
+  })
+  heartbeat()
+  const heartbeatTimer = setInterval(heartbeat, RUNTIME_HEARTBEAT_MS)
+  heartbeatTimer.unref?.()
+  writeRuntimeMarker(config, { startedAt: Date.now(), activeTurn: undefined })
+  // A run that died mid-turn left the in-flight turn in the runtime marker; say
+  // so in the chat before this run starts accepting new messages.
+  void reportPreviousCrash(config, previousRun)
+  // Reaching apply() outside the declared range means an exemption let it load.
+  void reportRuntimeMismatch(config)
   ctx.effect?.(() => () => {
     activeProvider = undefined
+    clearInterval(heartbeatTimer)
     disposeTurnTimers()
+    writeRuntimeMarker(config, { clean: true, stoppedAt: Date.now(), activeTurn: undefined })
   })
   ctx.tools.register(sendMessageTool(config))
   ctx.tools.register(sendFileTool(config))

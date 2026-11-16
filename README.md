@@ -3,6 +3,9 @@
 给 DeepSeek Harness（DSH）装一条**专用飞书通道**：DSH 里的 Agent 可以直接在飞书里聊，
 每轮答复自动回传成流式卡片，收到的图片和文件落进工作区，需要你拍板时发交互式问答卡。
 
+而且它**不会静默**：一轮跑几分钟也不让你干等——卡片上持续显示当前在跑哪个工具、已调用
+几个工具、已用时多少秒，思考过程另有单独一条消息，Agent 在干什么随时看得见。
+
 用的是你自己在飞书开放平台新建的自建应用（独立机器人），不和别的通道共用事件。
 
 ## 为什么这么设计
@@ -27,7 +30,9 @@
 
 - **双向通道**：飞书私聊 → DSH 会话；一轮结束把答复自动发回原聊天，不需要模型调工具
 - **流式卡片**：思考过程单独一条消息，正文卡片逐字出现，底栏依次是 `等待回答 → 流式输出中 → 完成`
-- **问答卡**：`ask_user_question` 渲染成按钮卡，选项一行一个、超过 3 项自动折叠；多题**逐题发**，答完才发下一题；答完的答复直接落在问答卡下方
+- **不会静默**：工具开始/结束时卡片立刻更新，长任务期间每 10 秒刷新一次进度——`正在执行 feishu_send_file · 已调用 3 个工具 · 已用时 42s`，不用猜它是卡住了还是在干活
+- **出错会说话**：回合失败、消息没投递到会话、长连接断开超过 20 秒、进程半途退出，都会往飞书推一条写明原因的通知，而不是安静地少一条回复（`problemNotices: false` 可关）
+- **问答卡**：`ask_user_question` 渲染成卡片，选项文字整行显示、下面一排数字按钮作答；多题**逐题发**，答完才发下一题；选项都不合适就点「补充」再直接回复文字，答完的答复落在问答卡下方
 - **附件**：入站图片和 `file` 消息（pdf/docx/xlsx/zip/音频）都下载到 `<workspacePath>/attachments/`，消息里附上绝对路径
 - **会话自动创建**：全新安装时，第一条飞书消息会自动建会话和「飞书」工作区，不需要先手填 `sessionId`
 - **桌面端镜像**：在桌面 GUI 里给同一会话发的消息，会以「来自桌面端：…」转发到飞书
@@ -43,7 +48,7 @@ dsh plugin add dsh-channel-feishu
 
 ```bash
 dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu
-dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.9/dsh-channel-feishu-0.9.9.tgz
+dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.10/dsh-channel-feishu-0.9.10.tgz
 ```
 
 依赖必须用扁平结构装（非 ASCII 目录下 pnpm 的软链会把路径写坏）：`pnpm install --node-linker=hoisted`。
@@ -57,6 +62,82 @@ appId/appSecret，先用飞书接口校验 token，再以 UTF-8 无 BOM 写入�
 
 允许名单：`allowedUsers` 留空时第一个发消息的人绑定该通道，其他发送者会被拒绝；
 想指定多人就显式列出 open_id。
+
+## 版本兼容
+
+manifest 里声明了 `engines.dsh`（当前 `>=0.2.2-rc.3 <0.3.0`），DSH 在加载前会按这个范围检查：
+
+- **不在范围内**：插件管理器拒绝激活，并给出「要求 … ／当前 …」的说明（设置 → 插件里能看到），不会静默失效；
+- **想强跑**：可以给这一版 DSH 一个精确版本豁免（插件管理器或 `dsh plugin allow-version`），风险自负；
+- **已给豁免**：插件加载后自检，发现运行版本不在声明范围，会往飞书推一条「插件和这版 DSH 不匹配」；就绪通知里也同时带插件版本和 DSH 版本，方便对账。
+
+升级 DSH 后如果插件跟不上：`dsh plugin add dsh-channel-feishu@latest`（本地开发副本则改 `engines.dsh` 并重装），然后重启 DSH。
+
+### 兜底：插件没加载时由外部提醒
+
+插件被拦下时自己跑不起来，所以工作区里带了一个不依赖插件的看门狗 `check-plugin-health.ps1`：
+
+- 插件加载后每 5 分钟刷新 `~/.dsh/feishu-channel-runtime.json` 的心跳；
+- 脚本判断「DSH 在跑、profile 装了插件、行没 `disabled: true`，但心跳超过 15 分钟没更新」→ 用机器人自己的 API 直接发飞书提醒（只读 `~/.dsh/feishu-channel.json`，不经过插件），写明最后一次成功加载的插件版本、DSH 版本、声明范围和处理建议；
+- 默认 6 小时内只提醒一次；`-DryRun` 先看文案。
+
+```powershell
+schtasks /Create /SC MINUTE /MO 30 /TN "DSHFeishuPluginHealth" `
+  /TR "powershell -NoProfile -ExecutionPolicy Bypass -File \"<workspace>\check-plugin-health.ps1\"" /F
+```
+
+不想用 Windows 计划任务，也可以在 DSH 里建一条定时任务定期执行这个脚本。
+
+## 纯文本通道（微信，规划中）
+
+微信 ClawBot 没有卡片，也不能编辑消息；实测客户端只在收到 FINISH 时渲染一次，重复 `client_id` 的 GENERATING 帧会被当成重复消息——所以这条通道**不做流式**，走另一套策略（`providers/wechat.js` + `providers/text-stream.js`）。
+
+**问答**：`ask_user_question` 以纯文本发出，编号选项 + 一句话说明怎么答：
+
+```
+需要你的回答：
+
+确认改哪里
+这个新会话里我没有上一轮的上下文——「介绍」指哪一份？
+
+1. 插件详情页 docs/DETAIL.zh.md（推荐）
+2. README 开头 +「它提供什么」
+3. 两处都加
+
+回数字选一个；选项都不合适，就直接打字补充；回「跳过」不作答。
+```
+
+回 `2` 就是第二项；回「两个都不合适，我补充一句」会被当成补充答案交给模型；回「跳过」跳过。**不用加前缀、不用记命令**——插件按「能对上选项就用，对不上就当补充」处理。
+
+**进度**：收到消息立刻显示「对方正在输入…」；超过 `textProgressSeconds` 秒还没有正文，才补一条 `还在跑 · 正在执行 pwsh · 已调用 2 个工具 · 已用时 35s`。
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `textProgressSeconds` | `30` | 多少秒没正文就发一条进度；`0` = 关闭进度（只留输入状态）；嫌 30 秒太频繁就调大，比如 60 / 120 |
+
+同一条进度不重复：只有工具或调用次数变了才发新的，间隔至少 3 分钟、每轮最多 3 条；正文一开始就不再发进度。飞书通道忽略这个参数（它用卡片每 10 秒刷新）。
+
+**正文**：**一轮一条完整消息**，不拆段、不做流式帧（客户端限制，实测无法原地刷新）。超过 4000 字的回答才按上限拆续条；发送失败会隔 800ms 重试一次。
+
+**投递可靠性**：`context_token` 由入站消息签发且会过期，过期后发送返回 `ret=-2 prepare failed`；插件不会删除已存的 token（删了会让后续回复彻底发不出去），失败时只做一次无 token 重试并记录 `finish-failed`。
+
+### 两个通道各用各的工作区
+
+每个通道按 `provider` 生成自己的一套名字，互不覆盖：
+
+| 项目 | 飞书 | 微信 |
+|---|---|---|
+| 默认工作区目录 | `<非系统盘>/dsh/feishu` | `<非系统盘>/dsh/wechat` |
+| 工作区标题（GUI 分组） | 飞书 | 微信 |
+| 新会话标题前缀 | `飞书会话 …` | `微信会话 …` |
+| 状态文件 | `<DSH_HOME>/feishu-channel-state.json` | `<DSH_HOME>/wechat-channel-state.json` |
+| 诊断日志 | `feishu-inbound.log` | `wechat-inbound.log` |
+| 运行时标记（崩溃检测） | `feishu-channel-runtime.json` | `wechat-channel-runtime.json` |
+| 工具名 | `feishu_send_message` / `feishu_send_file` / `feishu_channel_status` | `wechat_send_message` / `wechat_send_file` / `wechat_channel_status` |
+
+`workspacePath` 写了就用写的；只有两行都写同一个路径时，两个通道才会共用工作区。
+
+**为什么是两个 bundle 而不是同一个包的两行**：Cordis 按模块 URL 缓存，同一个包的两行会共用模块里的 `activeProvider` 等状态，后加载的那行会把前一行顶掉。所以微信会作为独立 bundle（`dsh-channel-wechat`，由同一份源码生成）发布，各自持有模块状态；两个包各插自己的一行，才能真正同时在线。
 
 ## 配置
 
@@ -98,10 +179,12 @@ node <profile>/node_modules/dsh-channel-feishu/scripts/setup.mjs
     enabled: true
     inboundEnabled: true        # 收消息；关掉只剩发送工具
     sessionMode: create         # 没有会话时，第一条消息自动建
-    workspacePath: ""           # 空 = <DSH_HOME>/dsh-feishu
+    workspacePath: ""           # 空 = 按通道默认：飞书 dsh/feishu、微信 dsh/wechat
     allowedUsers: []            # 空 = 第一个发消息的人绑定此通道
     streamingCards: true
     autoReply: true
+    problemNotices: true        # 出错/崩溃时往飞书推原因；关掉只剩日志
+    textProgressSeconds: 30     # 纯文本通道（微信）的进度间隔；0 = 不发进度
     mirrorUserMessages: true    # 桌面端消息转发到飞书
     permissionPreset: danger-full-access
     applyPermissionPreset: true

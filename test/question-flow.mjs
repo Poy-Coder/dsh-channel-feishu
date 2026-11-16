@@ -27,7 +27,7 @@ const { normalizeCardAction } = await import('../providers/feishu.js')
 const sent = { cards: [], attached: [], updates: [], texts: [] }
 let failCards = false
 
-registerProvider('fake', () => ({
+const makeFake = (overrides = {}) => ({
   id: 'fake',
   label: 'Fake',
   settings: () => ({ appId: '', appSecret: '', defaultChatId: 'oc_fake', region: 'feishu', baseUrl: '' }),
@@ -50,7 +50,11 @@ registerProvider('fake', () => ({
   },
   normalizeCardAction,
   parseInbound: () => null,
-}))
+  ...overrides,
+})
+registerProvider('fake', () => makeFake())
+// A channel without cards (WeChat shape): any unmatched message is the answer.
+registerProvider('fake-text', () => makeFake({ id: 'fake-text', label: 'FakeText', freeTextAnswers: true }))
 
 const ctx = {
   tools: { register: () => () => {} },
@@ -92,12 +96,21 @@ await new Promise((resolve) => setTimeout(resolve, 20))
 assert.equal(sent.cards.length, 1, 'question card was not sent')
 assert.equal(sent.attached[0].chatId, 'oc_fake')
 assert.equal(sent.attached[0].cardId, 'card_1')
-// Options are queued as bare full-width buttons (one block each).
-const optionButtons = sent.cards[0].body.elements.filter((element) => element.tag === 'button')
-assert.equal(optionButtons.length, 3) // two options plus 跳过
-assert.deepEqual(optionButtons.map((button) => button.behaviors[0].value), [
+// Option labels are markdown; the chips below carry only numbers, and 补充 / 跳过
+// share the closing action row.
+const isChipRow = (element) => element.tag === 'column_set'
+  && element.columns.every((column) => column.elements[0].tag === 'button' && /^\d+$/.test(column.elements[0].text.content))
+const chips = sent.cards[0].body.elements.filter(isChipRow).flatMap((row) => row.columns.map((column) => column.elements[0]))
+assert.deepEqual(chips.map((chip) => chip.behaviors[0].value), [
   { c: 'call-1', q: 0, o: 0 },
   { c: 'call-1', q: 0, o: 1 },
+])
+const labels = sent.cards[0].body.elements.find((element) => element.tag === 'markdown' && element.content.startsWith('**1**'))
+assert.match(labels.content, /交互卡片（推荐）/)
+const actionRow = sent.cards[0].body.elements.find((element) => element.tag === 'column_set'
+  && element.columns.some((column) => column.elements[0].text.content === '跳过'))
+assert.deepEqual(actionRow.columns.map((column) => column.elements[0].behaviors[0].value), [
+  { c: 'call-1', q: 0, other: true },
   { c: 'call-1', q: 0, skip: true },
 ])
 
@@ -223,5 +236,69 @@ const delegated = await answerUserQuestion(ctx, config, {
   signal: new AbortController().signal,
 }, next)
 assert.deepEqual(delegated, { answers: 'delegated' })
+
+// 9. 补充: the 补充 button arms the free-text path, so a message that matches no
+// option still becomes the answer (as custom text). Clicking it twice disarms,
+// and an ordinary message must then pass through untouched.
+const otherRequest = {
+  agent: { id: 'session-fake' },
+  questions,
+  wait: { callId: 'call-9' },
+  signal: new AbortController().signal,
+}
+const otherAnswer = answerUserQuestion(ctx, config, otherRequest, next)
+await new Promise((resolve) => setTimeout(resolve, 20))
+const clickOther = (value) => handleQuestionCardAction(ctx, config, {
+  operator: { open_id: 'ou_ok' },
+  action: { value },
+  context: { open_message_id: 'om_card_9', open_chat_id: 'oc_fake' },
+})
+const armed = await clickOther({ c: 'call-9', q: 0, other: true })
+assert.equal(armed.toast.type, 'info')
+assert.match(armed.toast.content, /补充/)
+// Arming, cancelling, arming again: the last state wins.
+assert.equal((await clickOther({ c: 'call-9', q: 0, other: true })).toast.type, 'info')
+assert.equal(consumeQuestionTextAnswer(ctx, config, { chatId: 'oc_fake', senderId: 'ou_ok', text: '随便说说' }), false)
+assert.equal((await clickOther({ c: 'call-9', q: 0, other: true })).toast.type, 'info')
+assert.equal(consumeQuestionTextAnswer(ctx, config, { chatId: 'oc_fake', senderId: 'ou_ok', text: '这两种都不对，我想自己说' }), true)
+assert.deepEqual(await otherAnswer, { answers: [{ id: 'mode', selected: [], custom: '这两种都不对，我想自己说' }] })
+assert.equal(pendingQuestionCount(), 0)
+
+// 10. A card-less channel (WeChat shape): the question is plain text, a number
+// picks an option and any other message is the supplement — no protocol to
+// learn and no 「补充」 button to press.
+failCards = true
+const textConfig = { ...config, provider: 'fake-text' }
+apply(ctx, textConfig)
+const plainRequest = {
+  agent: { id: 'session-fake' },
+  questions,
+  wait: { callId: 'call-10' },
+  signal: new AbortController().signal,
+}
+const plainAnswer = answerUserQuestion(ctx, textConfig, plainRequest, next)
+await new Promise((resolve) => setTimeout(resolve, 20))
+const prompt = sent.texts.at(-1).text
+assert.match(prompt, /1\. 交互卡片（推荐）/)
+assert.match(prompt, /回数字选一个/)
+assert.match(prompt, /直接打字补充/)
+assert.equal(consumeQuestionTextAnswer(ctx, textConfig, { chatId: 'oc_fake', senderId: 'ou_ok', text: '2' }), true)
+assert.deepEqual(await plainAnswer, { answers: [{ id: 'mode', selected: ['纯文本'] }] })
+
+const freeRequest = {
+  agent: { id: 'session-fake' },
+  questions,
+  wait: { callId: 'call-11' },
+  signal: new AbortController().signal,
+}
+const freeAnswer = answerUserQuestion(ctx, textConfig, freeRequest, next)
+await new Promise((resolve) => setTimeout(resolve, 20))
+assert.equal(consumeQuestionTextAnswer(ctx, textConfig, {
+  chatId: 'oc_fake', senderId: 'ou_ok', text: '两个都不合适，我补充一句',
+}), true)
+assert.deepEqual(await freeAnswer, {
+  answers: [{ id: 'mode', selected: [], custom: '两个都不合适，我补充一句' }],
+})
+failCards = false
 
 console.log('question-flow: all assertions passed')

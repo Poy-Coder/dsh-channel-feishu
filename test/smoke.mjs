@@ -127,7 +127,7 @@ assert.equal(
 // 7c. Sessions created by the channel land in a dedicated workspace directory,
 // never silently on the system drive.
 const defaultWorkspace = workspacePathFor({})
-assert.ok(defaultWorkspace.endsWith('dsh-feishu'), `unexpected default: ${defaultWorkspace}`)
+assert.ok(defaultWorkspace.endsWith(join('dsh', 'feishu')), `unexpected default: ${defaultWorkspace}`)
 assert.ok(process.platform !== 'win32' || !/^c:/i.test(defaultWorkspace), 'default must stay off the system drive')
 assert.equal(workspacePathFor({ workspacePath: '  D:\\other  ' }), 'D:\\other')
 assert.equal(createCwdFor({}), defaultWorkspace)

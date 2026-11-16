@@ -866,6 +866,14 @@ export function createFeishuProvider(config = {}, deps = {}) {
      * `onEvent(data)` receives one `im.message.receive_v1` payload;
      * `onCardAction(data)` receives one flattened `card.action.trigger`
      * payload; `onState({ ready, error })` publishes transport health.
+     *
+     * A half-open TCP socket is the failure this connection hides best: the
+     * socket stays OPEN, no 'close' fires, and events simply stop. The SDK only
+     * notices when `wsConfig.pingTimeout` is set — with it, every ping arms a
+     * watchdog that terminates the socket when no pong/inbound frame arrives, so
+     * the normal reconnect flow runs. Without it, `armLiveness()` is a no-op and
+     * the channel goes deaf forever. Every SDK lifecycle callback is wired to
+     * `onState` for the same reason: a silent reconnect is a silent outage.
      */
     async connect({ onEvent, onState, onCardAction }, signal) {
       const resolved = await settingsAsync()
@@ -886,47 +894,78 @@ export function createFeishuProvider(config = {}, deps = {}) {
 
       let client
       let disposed = false
-      try {
-        const dispatcher = new Lark.EventDispatcher({}).register({
-          'im.message.receive_v1': async (data) => {
-            try {
-              await onEvent(data)
-            } catch (error) {
-              log({ event: 'channel', result: 'handler-failed', reason: error instanceof Error ? error.message : String(error) })
-            }
-          },
-          // Interactive card buttons: the answer travels back through the same
-          // long connection as message events (no callback URL needed).
-          'card.action.trigger': async (data) => {
-            try {
-              return await onCardAction?.(data)
-            } catch (error) {
-              log({ event: 'channel', result: 'card-handler-failed', reason: error instanceof Error ? error.message : String(error) })
-              return undefined
-            }
-          },
-        })
-        client = new Lark.WSClient({
-          appId: resolved.appId,
-          appSecret: resolved.appSecret,
-          loggerLevel: Lark.LoggerLevel?.info,
-        })
-        await client.start({ eventDispatcher: dispatcher })
-        if (disposed) {
-          try { client.close() } catch { /* already closing */ }
-        } else {
-          onState?.({ ready: true, error: '' })
-        }
-      } catch (error) {
-        const reason = error instanceof Error ? error.message : String(error)
-        onState?.({ ready: false, error: reason })
-        log({ event: 'channel', result: 'connect-failed', reason })
+      let restartTimer
+      const publish = (ready, error = '') => onState?.({ ready, error })
+      const dispatcher = new Lark.EventDispatcher({}).register({
+        'im.message.receive_v1': async (data) => {
+          try {
+            await onEvent(data)
+          } catch (error) {
+            log({ event: 'channel', result: 'handler-failed', reason: error instanceof Error ? error.message : String(error) })
+          }
+        },
+        // Interactive card buttons: the answer travels back through the same
+        // long connection as message events (no callback URL needed).
+        'card.action.trigger': async (data) => {
+          try {
+            return await onCardAction?.(data)
+          } catch (error) {
+            log({ event: 'channel', result: 'card-handler-failed', reason: error instanceof Error ? error.message : String(error) })
+            return undefined
+          }
+        },
+      })
+
+      const scheduleRestart = (reason) => {
+        if (disposed || restartTimer) return
+        restartTimer = setTimeout(async () => {
+          restartTimer = undefined
+          if (disposed) return
+          log({ event: 'channel', result: 'restart', reason })
+          try { client?.close?.() } catch { /* ignore */ }
+          await startClient()
+        }, 30_000)
+        restartTimer.unref?.()
       }
+
+      const startClient = async () => {
+        if (disposed) return
+        try {
+          client = new Lark.WSClient({
+            appId: resolved.appId,
+            appSecret: resolved.appSecret,
+            loggerLevel: Lark.LoggerLevel?.info,
+            // 60 s without a pong (or any inbound frame) after a ping ⇒ the
+            // socket is presumed dead and gets terminated to reconnect.
+            wsConfig: { pingTimeout: 60 },
+            onReady: () => publish(true, ''),
+            onReconnecting: () => publish(false, 'reconnecting'),
+            onReconnected: () => publish(true, ''),
+            onError: (error) => {
+              const reason = error instanceof Error ? error.message : String(error)
+              publish(false, reason)
+              log({ event: 'channel', result: 'sdk-error', reason })
+              // The SDK gives up on fatal errors; bring a fresh client back.
+              scheduleRestart(reason)
+            },
+          })
+          await client.start({ eventDispatcher: dispatcher })
+          if (!disposed) publish(true, '')
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error)
+          publish(false, reason)
+          log({ event: 'channel', result: 'connect-failed', reason })
+          scheduleRestart(reason)
+        }
+      }
+
+      await startClient()
 
       return () => {
         disposed = true
+        if (restartTimer) clearTimeout(restartTimer)
         try { client?.close?.() } catch { /* ignore */ }
-        onState?.({ ready: false, error: 'closed' })
+        publish(false, 'closed')
       }
     },
   }

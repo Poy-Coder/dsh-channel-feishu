@@ -8,9 +8,11 @@
  */
 
 import { createFeishuProvider } from './feishu.js'
+import { createWechatProvider } from './wechat.js'
 
 const factories = new Map([
   ['feishu', createFeishuProvider],
+  ['wechat', createWechatProvider],
 ])
 
 export function registerProvider(id, factory) {
