@@ -13,9 +13,10 @@
         # plugin, so "installs and starts receiving" is the expected behaviour.
         # Set false when the bot should only send (feishu_send_message/file).
         inboundEnabled: true
-        # Session inbound messages go to; `create` makes it when missing.
+        # Session inbound messages go to; `create` makes it when missing, which
+        # is what a fresh install needs: the first message opens the session.
         sessionId: ''
-        sessionMode: resume
+        sessionMode: create
         # Sender allowlist (open_id); empty accepts anyone.
         allowedUsers: []
         # Workspace that owns channel sessions; '' uses <home>/dsh-feishu.

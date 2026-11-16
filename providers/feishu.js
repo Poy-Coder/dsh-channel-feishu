@@ -24,7 +24,7 @@
  *   3. the credentials file <DSH_HOME>/feishu-channel.json
  */
 
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 
@@ -512,6 +512,10 @@ export function parseImageContent(content) {
 export function inboundFilesDir(config) {
   const configured = String(config?.inboundFilesDir ?? '').trim()
   if (configured) return configured
+  // Attachments belong with the work they feed: put them inside the channel
+  // workspace so the agent can open them by a workspace-relative path.
+  const workspace = String(config?.workspacePath ?? '').trim()
+  if (workspace) return join(workspace, 'attachments')
   return join(dirname(credentialsFilePath()), 'feishu-inbound-files')
 }
 
@@ -547,8 +551,40 @@ export async function downloadMessageImage(base, token, messageId, imageKey, con
   return path
 }
 
-/** Normalize one `im.message.receive_v1` payload; null means "nothing usable". */
-export function parseInboundEvent(event) {
+/** Keep an attachment name usable as a Windows path segment. */
+function safeFileName(fileName, fileKey) {
+  const base = String(fileName ?? '').split(/[\\/]/).pop() ?? ''
+  const cleaned = base.replace(/[<>:"|?*\u0000-\u001f]/g, '').trim()
+  if (cleaned) return cleaned.slice(0, 120)
+  return `${String(fileKey ?? 'file').slice(-12) || 'file'}.bin`
+}
+
+/**
+ * Download one message file (document, archive, audio…) through the
+ * message-resource endpoint and land it in the inbound attachment directory.
+ */
+export async function downloadMessageFile(base, token, messageId, fileKey, fileName, config, signal) {
+  const resource = `${base}/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`
+    + `/resources/${encodeURIComponent(fileKey)}?type=file`
+  const response = await fetch(resource, { headers: { authorization: `Bearer ${token}` }, signal })
+  if (!response.ok) throw new Error(`Feishu file download failed (HTTP ${response.status})`)
+  const buffer = Buffer.from(await response.arrayBuffer())
+  const dir = inboundFilesDir(config)
+  mkdirSync(dir, { recursive: true })
+  let name = safeFileName(fileName, fileKey)
+  let path = join(dir, name)
+  if (existsSync(path)) {
+    const at = name.lastIndexOf('.')
+    const stem = at > 0 ? name.slice(0, at) : name
+    const ext = at > 0 ? name.slice(at) : ''
+    name = `${stem}-${String(fileKey ?? '').slice(-6)}${ext}`
+    path = join(dir, name)
+  }
+  writeFileSync(path, buffer)
+  return path
+}
+
+/** Normalize one `im.message.receive_v1` payload; null means "nothing usable". */export function parseInboundEvent(event) {
   const message = event?.message
   const sender = event?.sender
   if (!message || !sender) return null
@@ -556,6 +592,7 @@ export function parseInboundEvent(event) {
   const mentions = message.mentions
   let text = ''
   let imageKeys = []
+  let files = []
   if (messageType === 'text') {
     text = stripMentions(parseTextContent(message.content), mentions)
   } else if (messageType === 'post') {
@@ -565,6 +602,9 @@ export function parseInboundEvent(event) {
   } else if (messageType === 'image') {
     const key = parseImageContent(message.content)
     if (key) imageKeys = [key]
+  } else if (messageType === 'file') {
+    const file = parseFileContent(message.content)
+    if (file.fileKey) files = [file]
   } else {
     return {
       dedupeKey: String(event?.header?.event_id ?? ''),
@@ -574,6 +614,7 @@ export function parseInboundEvent(event) {
       messageId: String(message.message_id ?? ''),
       text: '',
       imageKeys: [],
+      files: [],
       unsupported: messageType,
     }
   }
@@ -585,7 +626,21 @@ export function parseInboundEvent(event) {
     messageId: String(message.message_id ?? ''),
     text,
     imageKeys,
+    files,
     unsupported: '',
+  }
+}
+
+/** One `file` message body: `{ file_key, file_name }`. */
+export function parseFileContent(content) {
+  try {
+    const parsed = JSON.parse(content ?? '{}')
+    return {
+      fileKey: typeof parsed?.file_key === 'string' ? parsed.file_key : '',
+      fileName: typeof parsed?.file_name === 'string' ? parsed.file_name : '',
+    }
+  } catch {
+    return { fileKey: '', fileName: '' }
   }
 }
 
@@ -681,6 +736,13 @@ export function createFeishuProvider(config = {}, deps = {}) {
       const resolved = await settingsAsync()
       return await downloadMessageImage(
         resolved.baseUrl, await token(signal), messageId, imageKey, config, signal,
+      )
+    },
+
+    async downloadFile({ messageId, fileKey, fileName }, signal) {
+      const resolved = await settingsAsync()
+      return await downloadMessageFile(
+        resolved.baseUrl, await token(signal), messageId, fileKey, fileName, config, signal,
       )
     },
 

@@ -35,9 +35,11 @@ export {
   attachmentKind,
   closeCard,
   createCard,
+  downloadMessageFile,
   downloadMessageImage,
   imageExtension,
   inboundFilesDir,
+  parseFileContent,
   parseImageContent,
   parseInboundEvent,
   parsePostContent,
@@ -90,6 +92,7 @@ export const Config = z.object({
   defaultChatId: z.string().default('').description('Destination used when a tool call omits receiveId.'),
   logFile: z.string().default('').description('Inbound diagnostics log path.'),
   readyNotice: z.boolean().default(true).description('Send one "channel ready" message to the default chat after the inbound long connection comes up.'),
+  mirrorUserMessages: z.boolean().default(false).description('Post messages typed outside Feishu (desktop GUI) into the owning chat, prefixed with 其他端.'),
   logLevel: z.union([z.const('debug'), z.const('info'), z.const('warn'), z.const('error')])
     .default('info')
     .description('Minimum severity written to the diagnostics log.'),
@@ -1115,6 +1118,10 @@ function nextStepsOf(config, result, inbound) {
   if (!String(result?.defaultChatId ?? '').trim()) {
     steps.push('没有默认会话：把 defaultChatId（oc_ 开头）写进凭据文件，或在行 config 里设置')
   }
+  if (!String(currentSessionId(config ?? {}) ?? '').trim()
+    && String(config?.sessionMode ?? 'resume').toLowerCase() !== 'create') {
+    steps.push('还没有会话：给 feishu-channel 行设 sessionMode: create，第一条飞书消息会自动开一个会话')
+  }
   return steps
 }
 
@@ -1475,6 +1482,27 @@ const PLUGIN_VERSION = (() => {
 })()
 
 let readyAnnounced = false
+
+/** Ids of the user messages this channel injected, so they are not mirrored back. */
+const channelPromptIds = new Set()
+
+/**
+ * Mirror a message typed outside Feishu (desktop GUI) into the owning chat, so
+ * one conversation can be followed from either surface.
+ */
+async function mirrorUserMessage(config, sessionId, text) {
+  const chatId = replyTargetOf(config, sessionId)
+  if (!chatId) return
+  const body = String(text ?? '').trim()
+  if (!body) return
+  const clipped = body.length > 2000 ? `${body.slice(0, 2000)}…` : body
+  try {
+    await provider().sendText({ chatId, text: `👤 其他端：${clipped}` })
+    logInbound(config, { event: 'mirror', result: 'sent', sessionId, chatId })
+  } catch (error) {
+    logInbound(config, { event: 'mirror', result: 'failed', sessionId, reason: errorText(error) })
+  }
+}
 
 /**
  * One "channel ready" message per process.
@@ -2176,11 +2204,33 @@ export async function handleInboundEvent(ctx, config, data, seen) {
     }
   }
 
+  const inboundFiles = Array.isArray(inbound.files) ? inbound.files : []
+  if (inboundFiles.length > 0) {
+    const messageId = inbound.messageId
+    if (!messageId) {
+      log({ event: 'inbound', result: 'file-error', reason: 'message_id missing', senderId, chatId })
+    } else {
+      const savedFiles = []
+      for (const file of inboundFiles.slice(0, 4)) {
+        try {
+          savedFiles.push(await provider().downloadFile({
+            messageId, fileKey: file.fileKey, fileName: file.fileName,
+          }))
+        } catch (error) {
+          log({ event: 'inbound', result: 'file-error', reason: errorText(error), senderId, chatId })
+        }
+      }
+      if (savedFiles.length > 0) {
+        text = [text, ...savedFiles.map((path) => `[文件] ${path}`)].filter(Boolean).join('\n')
+        log({ event: 'inbound', result: 'files', count: savedFiles.length, senderId, chatId })
+      }
+    }
+  }
+
   if (!text) {
     log({ event: 'inbound', result: 'dropped', reason: 'empty text', senderId, chatId })
     return
   }
-
   // Control phrases are consumed here, never delivered to the model.
   // `/new` still starts a fresh conversation; `/help` lists the rest.
   // Any accepted inbound counts as channel activity, commands included, so the
@@ -2196,10 +2246,22 @@ export async function handleInboundEvent(ctx, config, data, seen) {
   // free-text answer settles the tool call instead of starting a new turn.
   if (consumeQuestionTextAnswer(ctx, config, { chatId, senderId, text })) return
 
-  const sessionId = currentSessionId(config)
+  let sessionId = currentSessionId(config)
   if (!sessionId) {
-    warnTo(ctx, 'inbound message dropped: no sessionId configured')
-    log({ event: 'inbound', result: 'dropped', reason: 'no sessionId configured', senderId, chatId })
+    const mode = String(config.sessionMode ?? 'resume').toLowerCase()
+    if (mode !== 'create') {
+      warnTo(ctx, 'inbound message dropped: no sessionId configured')
+      log({
+        event: 'inbound', result: 'dropped',
+        reason: 'no sessionId configured (set sessionMode: create to bootstrap one)', senderId, chatId,
+      })
+      return
+    }
+    // Fresh install: the bundle row carries no sessionId. Create the channel's
+    // session (and, below, its Feishu workspace) from the first inbound message
+    // instead of dropping it — otherwise a new install looks connected but deaf.
+    log({ event: 'inbound', result: 'bootstrap', reason: 'no session yet; creating one', senderId, chatId })
+    await switchToNewSession(ctx, config, { chatId, senderId, firstMessage: text })
     return
   }
 
@@ -2221,9 +2283,12 @@ export async function handleInboundEvent(ctx, config, data, seen) {
   // DSH only validates identity when reading the log, not when appending, so a
   // raw `{ content, source }` followup corrupts the session silently.
   lastInboundAt = Date.now()
+  const promptId = randomUUID()
+  channelPromptIds.add(promptId)
+  if (channelPromptIds.size > 200) channelPromptIds.delete(channelPromptIds.values().next().value)
   try {
     await resolved.agent.followup({
-      id: randomUUID(),
+      id: promptId,
       role: 'user',
       content: [{ type: 'text', text: inboundUserText(text) }],
       source: { kind: 'user' },
@@ -3013,6 +3078,23 @@ function startInbound(ctx, config) {
         observeSessionEvent(scoped, config, session, event)
       })
 
+      // Messages typed elsewhere (desktop GUI) are not visible in Feishu unless
+      // the channel mirrors them: user messages enter the live inbox, and the
+      // ones this channel injected itself are recognised by id and skipped.
+      const offInbox = scoped.on?.('agent/inbox/inserted', (payload) => {
+        if (config.mirrorUserMessages !== true) return
+        const agent = payload?.agent
+        const sessionId = agent?.session?.id ?? agent?.id
+        if (!sessionId || sessionId !== activeSessionId(config)) return
+        const message = payload?.message
+        if (!message?.id || channelPromptIds.has(message.id)) return
+        const text = textOfMessage(message)
+        if (!text.trim()) return
+        // Scheduled reminders are injected as user messages; they are not typed.
+        if (/^\[SCHEDULE REMINDER/i.test(text.trim())) return
+        void mirrorUserMessage(config, sessionId, text)
+      })
+
       // Answer ask_user_question in Feishu: without this, a Feishu-only session
       // fails the tool call with NO_PROVIDER (no browser page to answer it).
       // Prepend so the chat wins over the GUI relay when the session is open in
@@ -3058,6 +3140,7 @@ function startInbound(ctx, config) {
         disposed = true
         clearInterval(releaseTimer)
         try { offSessionEvent?.() } catch { /* ignore */ }
+        try { offInbox?.() } catch { /* ignore */ }
         try { offQuestion?.() } catch { /* ignore */ }
         try { connectionCleanup() } catch { /* ignore */ }
         disposeAgentStreams()
@@ -3073,7 +3156,9 @@ function startInbound(ctx, config) {
 
 export function apply(ctx, config = {}) {
   if (config.enabled === false) return
-  activeProvider = resolveProvider(config, {
+  // Hand the provider the effective workspace so inbound attachments land in
+  // <workspace>/attachments even when the row leaves workspacePath empty.
+  activeProvider = resolveProvider({ ...config, workspacePath: workspacePathFor(config) }, {
     log: (record) => logInbound(config, record),
     credentials: typeof ctx.get === 'function' ? ctx.get('credentials') : undefined,
   })
