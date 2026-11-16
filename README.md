@@ -48,7 +48,7 @@ dsh plugin add dsh-channel-feishu
 
 ```bash
 dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu
-dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.12/dsh-channel-feishu-0.9.12.tgz
+dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.13/dsh-channel-feishu-0.9.13.tgz
 ```
 
 依赖必须用扁平结构装（非 ASCII 目录下 pnpm 的软链会把路径写坏）：`pnpm install --node-linker=hoisted`。
@@ -270,6 +270,8 @@ owner 记在通道状态文件里，删掉状态文件里的 `owner` 字段即�
 |---|---|
 | 装完能收到「通道已就绪」，发消息没反应 | 看日志有没有 `inbound`；老版本在无会话时会直接丢弃 |
 | `card-update-failed` / `300309 streaming mode is closed` | 卡片不是流式模式，更新写不进去；0.9.0 起问答卡已开启流式 |
+| 一条回答出现两张卡片（一张停在「回复中」并写着「本轮回答见下方 ↓」，一张是正文） | 流式写入与收尾抢同一个 `sequence`（飞书 `300317`），收尾失败后会补发一张。现在同一张卡的写入按 `sequence` 串行，冲突自动重试一次，日志里应只剩 `card closed` |
+| 长连接显示「已恢复」，但发消息没反应（出站正常） | SDK 重连可能拿回一条“心跳通、事件不通”的 socket。现在重连后 3 分钟没有入站就重建客户端（日志 `rebuild`），在线期间每 2 分钟补拉一次历史（`reconcile`），漏掉的消息会在 2 分钟内补回 |
 | 插件加载失败、工具全消失 | 检查 `package.json` 是否被写成带 BOM 的 UTF-8 |
 | 发文件报权限错误 | 应用要开 `im:resource` 上传权限 |
 | 同一 App 两条长连接 | 只能有一个通道插件用这个 App，旧通道要先 `disabled: true` |

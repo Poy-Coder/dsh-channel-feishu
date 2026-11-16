@@ -165,6 +165,17 @@ Tell them, in this order:
 - **Rate limits are real.** Feishu returns `230020` when a chat is written too fast; the
   card writer stays at ~200 ms per update, backs off 2 s on that error, and retries the
   final close once. Do not lower the interval.
+- **One writer per card.** CardKit numbers writes per card entity: a write whose `sequence`
+  is not greater than the last applied one fails with `300317 sequence number compare
+  failed`. The streaming flush and the turn's closing write must never be in flight at the
+  same time, so the plugin chains every write to one card. If the close loses that race
+  the turn falls back to re-posting the answer, and the chat shows two cards.
+- **A reconnect can come back deaf.** The SDK's `onReconnected` reports a socket that
+  answers pings but no longer receives events; outbound REST keeps working, so nothing
+  looks broken. Two guards cover it: a reconnect that sees no inbound event for three
+  minutes rebuilds the client, and while connected the plugin polls the chat history every
+  two minutes (`reconcile`). Both rely on the message-id dedupe, so a rebuilt connection
+  cannot answer the same message twice.
 - **CoT events are byte-bounded.** The platform counts UTF-8 bytes; a long Chinese
   reasoning block must be chunked (the plugin does this). `10001 event[N] content too
   long` means the payload exceeded the budget.

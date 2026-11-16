@@ -506,6 +506,8 @@ function disposeTurnTimers() {
 
 /** Coalesce stream deltas: one Feishu write per CARD_FLUSH_MS at most. */
 function scheduleCardFlush(record, ctx, config) {
+  // The turn is over: `finalizeTurn` owns the card and writes the last text.
+  if (record.closed) return
   if (record.timer) return
   // Feishu documents ~8 card writes/second; 200 ms keeps us well under it, and a
   // rate-limit answer pushes the next write out by the backoff instead of
@@ -533,12 +535,70 @@ const isTransientNetworkError = (error) => /fetch failed|ECONNRESET|ETIMEDOUT|EA
 /** Feishu closes a streaming card after a while; further element writes get 300309. */
 const isStreamingClosed = (error) => /300309|streaming mode is closed/i.test(String(error?.message ?? error))
 
+/**
+ * Serialize every write to one card.
+ *
+ * Feishu numbers writes per card entity and rejects one whose sequence is not
+ * greater than the last application (`300317 sequence number compare failed`).
+ * The 200 ms flush timer and `finalizeTurn` both write to the same entity: with
+ * two requests in flight, Feishu can receive the later-numbered one first and
+ * the earlier one dies. When that earlier one is the close, the turn ends as
+ * two cards — the stale streaming card plus a re-posted answer. One FIFO chain
+ * per card makes "allocation order === delivery order" structural.
+ */
+function cardWrite(record, task) {
+  const next = (record.writeChain ?? Promise.resolve()).then(task)
+  record.writeChain = next.then(() => {}, () => {})
+  return next
+}
+
+/**
+ * One streaming write: content, then the footer flip.
+ *
+ * Runs inside `cardWrite`, so no close can slip in between these two writes,
+ * and re-checks `record.closed` because `finalizeTurn` may have taken the card
+ * while this task was queued.
+ */
+async function writeProgressCard(record, card, text) {
+  if (record.closed) return
+  let retried = false
+  for (;;) {
+    try {
+      card.sequence += 1
+      await provider().card.update({ cardId: card.cardId, content: text, sequence: card.sequence })
+      break
+    } catch (error) {
+      // Another write bumped the sequence first: retry once with a fresh number
+      // instead of freezing the card mid-answer (the "回答烂尾" symptom).
+      if (!isSequenceConflict(error) || retried) throw error
+      retried = true
+    }
+  }
+  record.lastCardText = text
+  record.updates = (record.updates ?? 0) + 1
+  record.lastSentAt = Date.now()
+  // The footer opens on 等待回答 (nothing has streamed yet) and switches here
+  // the first time real answer text lands.
+  if (record.phase === 'answering' && record.footerText !== FOOTER_STREAMING) {
+    try {
+      card.sequence += 1
+      await provider().card.update({
+        cardId: card.cardId,
+        content: `<font color="grey">${FOOTER_STREAMING}</font>`,
+        sequence: card.sequence,
+        elementId: 'note_1',
+      })
+      record.footerText = FOOTER_STREAMING
+    } catch { /* footer is cosmetic */ }
+  }
+}
+
 async function flushCard(record, ctx, config) {
   flushRan += 1
   const text = replyText(record)
   if (!text.trim()) return
-  // One write in flight per card: a second PATCH started before the first
-  // returns would reuse the sequence number and Feishu rejects the batch.
+  // Coalesce: a flush scheduled while one is already queued only repeats the
+  // same text, and a second concurrent PATCH would fight over the sequence.
   if (record.flushing) {
     record.flushPending = true
     return
@@ -547,43 +607,9 @@ async function flushCard(record, ctx, config) {
   if (!card) return
   if (text === record.lastCardText) return
   record.flushing = true
-  let sequenceRetried = false
   try {
-    card.sequence += 1
-    await provider().card.update({ cardId: card.cardId, content: text, sequence: card.sequence })
-    record.lastCardText = text
-    record.updates = (record.updates ?? 0) + 1
-    record.lastSentAt = Date.now()
-    // The footer opens on 等待回答 (nothing has streamed yet) and switches here
-    // the first time real answer text lands.
-    if (record.phase === 'answering' && record.footerText !== FOOTER_STREAMING) {
-      try {
-        card.sequence += 1
-        await provider().card.update({
-          cardId: card.cardId,
-          content: `<font color="grey">${FOOTER_STREAMING}</font>`,
-          sequence: card.sequence,
-          elementId: 'note_1',
-        })
-        record.footerText = FOOTER_STREAMING
-      } catch { /* footer is cosmetic */ }
-    }
+    await cardWrite(record, () => writeProgressCard(record, card, text))
   } catch (error) {
-    if (isSequenceConflict(error) && !sequenceRetried) {
-      // Another write bumped the sequence first: retry once with a fresh number
-      // instead of freezing the card mid-answer (the "回答烂尾" symptom).
-      sequenceRetried = true
-      card.sequence += 1
-      try {
-        await provider().card.update({ cardId: card.cardId, content: text, sequence: card.sequence })
-        record.lastCardText = text
-        record.lastSentAt = Date.now()
-        record.updates = (record.updates ?? 0) + 1
-        return
-      } catch (again) {
-        error = again
-      }
-    }
     if (isRateLimited(error)) {
       // Keep the card: slow down instead of dropping to text, which would need
       // another message and hit the same limit.
@@ -636,16 +662,21 @@ async function postAnswerBelow(ctx, config, chatId, record, text) {
     } catch { /* footer is cosmetic */ }
     await provider().card.close({ cardId, sequence: 2, summary: summaryOf(text) })
     if (record.card) {
+      const prior = record.card
       try {
-        record.card.sequence += 1
-        await provider().card.update({
-          cardId: record.card.cardId,
-          content: '<font color="grey">本轮回答见下方 ↓</font>',
-          sequence: record.card.sequence,
-        })
-        record.card.sequence += 1
-        await provider().card.close({
-          cardId: record.card.cardId, sequence: record.card.sequence, summary: '回答见下方',
+        // The pointer text goes through the same card chain as any late delta:
+        // it is the last write this card will ever take.
+        await cardWrite(record, async () => {
+          prior.sequence += 1
+          await provider().card.update({
+            cardId: prior.cardId,
+            content: '<font color="grey">本轮回答见下方 ↓</font>',
+            sequence: prior.sequence,
+          })
+          prior.sequence += 1
+          await provider().card.close({
+            cardId: prior.cardId, sequence: prior.sequence, summary: '回答见下方',
+          })
         })
       } catch { /* the new card already carries the answer */ }
     }
@@ -653,6 +684,85 @@ async function postAnswerBelow(ctx, config, chatId, record, text) {
   } catch (error) {
     warnTo(ctx, `posting the answer below the questions failed: ${errorText(error)}`)
     return ''
+  }
+}
+
+/**
+ * The last writes of a turn: land the full text, flip the footer, freeze the card.
+ *
+ * `replay` is only true on the first attempt. The engine can hand over the whole
+ * answer in one burst, which would land as a single jump; replaying it in slices
+ * keeps the "typing" illusion. A retry must not replay — the reader has already
+ * watched it once.
+ */
+async function applyFinalCard(record, card, text, replay) {
+  const shown = String(record.lastCardText ?? '').length
+  const burst = replay && (record.updates ?? 0) < 8 && text.length > 80 && shown < text.length
+  if (burst) {
+    // ~10 characters per tick, 150 ms apart, with the network round trip
+    // subtracted so the cadence does not stretch to RTT + sleep.
+    const tick = 150
+    const size = Math.max(6, Math.ceil(text.length / 40))
+    for (let end = Math.min(shown + size, text.length); end < text.length; end += size) {
+      const started = Date.now()
+      card.sequence += 1
+      await provider().card.update({
+        cardId: card.cardId, content: text.slice(0, end), sequence: card.sequence,
+      })
+      record.updates = (record.updates ?? 0) + 1
+      const spent = Date.now() - started
+      await new Promise((resolve) => { const t = setTimeout(resolve, Math.max(0, tick - spent)); t.unref?.() })
+    }
+    record.lastCardText = ''
+  }
+  if (text !== record.lastCardText) {
+    card.sequence += 1
+    await provider().card.update({ cardId: card.cardId, content: text, sequence: card.sequence })
+    record.lastCardText = text
+  }
+  // Footer flips from "streaming" to "done" before the card freezes.
+  try {
+    card.sequence += 1
+    await provider().card.update({
+      cardId: card.cardId,
+      content: '<font color="grey">完成</font>',
+      sequence: card.sequence,
+      elementId: 'note_1',
+    })
+  } catch { /* footer is cosmetic */ }
+  card.sequence += 1
+  try {
+    await provider().card.close({
+      cardId: card.cardId, sequence: card.sequence, summary: summaryOf(text),
+    })
+  } catch (error) {
+    // The final write is the one that must land: back off once, then retry.
+    // A single network blip used to lose the whole card; treat it like a rate
+    // limit and retry once.
+    if (!isRateLimited(error) && !isTransientNetworkError(error)) throw error
+    await new Promise((resolve) => { const t = setTimeout(resolve, 1_500); t.unref?.() })
+    card.sequence += 1
+    await provider().card.close({
+      cardId: card.cardId, sequence: card.sequence, summary: summaryOf(text),
+    })
+  }
+}
+
+/**
+ * Close the turn card, retrying the one failure that means "still alive".
+ *
+ * A sequence conflict means another write landed at Feishu first; the card has
+ * not been closed, so closing again with a higher number finishes it. Anything
+ * else (a dead streaming entity, a revoked permission) is left to the caller,
+ * which re-posts the answer as a fresh card.
+ */
+async function writeFinalCard(record, card, text) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await cardWrite(record, () => applyFinalCard(record, card, text, attempt === 0))
+    } catch (error) {
+      if (!isSequenceConflict(error) || attempt >= 2) throw error
+    }
   }
 }
 
@@ -665,6 +775,9 @@ export async function finalizeTurn(ctx, config, sessionId, turn, reason) {
   const record = turns.get(key)
   if (!record) return
   turns.delete(key)
+  // From here the turn card belongs to this function. A delta that arrives late
+  // must not queue another streaming write behind (or ahead of) the close.
+  record.closed = true
   if (record.timer) {
     clearTimeout(record.timer)
     record.timer = undefined
@@ -701,17 +814,16 @@ export async function finalizeTurn(ctx, config, sessionId, turn, reason) {
   if (!answerTextOf(record).trim()) {
     if (cardsOn && record.card) {
       const note = failure ? `⚠️ 这一轮出错了：${failure}` : '（没有产生文字回答）'
+      const card = record.card
       try {
-        record.card.sequence += 1
-        await provider().card.update({
-          cardId: record.card.cardId, content: note, sequence: record.card.sequence,
-        })
-        record.card.sequence += 1
-        await provider().card.close({
-          cardId: record.card.cardId, sequence: record.card.sequence, summary: note,
+        await cardWrite(record, async () => {
+          card.sequence += 1
+          await provider().card.update({ cardId: card.cardId, content: note, sequence: card.sequence })
+          card.sequence += 1
+          await provider().card.close({ cardId: card.cardId, sequence: card.sequence, summary: note })
         })
         logInbound(config, {
-          event: 'card', result: 'closed', sessionId, turn, cardId: record.card.cardId,
+          event: 'card', result: 'closed', sessionId, turn, cardId: card.cardId,
           chars: 0, updates: record.updates ?? 0, note: failure ? 'failed' : 'empty',
         })
         return
@@ -745,59 +857,7 @@ export async function finalizeTurn(ctx, config, sessionId, turn, reason) {
     const card = await ensureCard(record, ctx, config)
     if (card) {
       try {
-        // The engine can hand over the whole answer in one burst, which would
-        // land as a single jump. When that happens, replay the text in slices so
-        // the reader still sees it appear progressively.
-        const shown = String(record.lastCardText ?? '').length
-        const burst = (record.updates ?? 0) < 8 && text.length > 80 && shown < text.length
-        if (burst) {
-          // ~10 characters per tick, 150 ms apart, with the network round trip
-          // subtracted so the cadence does not stretch to RTT + sleep.
-          const tick = 150
-          const size = Math.max(6, Math.ceil(text.length / 40))
-          for (let end = Math.min(shown + size, text.length); end < text.length; end += size) {
-            const started = Date.now()
-            card.sequence += 1
-            await provider().card.update({
-              cardId: card.cardId, content: text.slice(0, end), sequence: card.sequence,
-            })
-            record.updates = (record.updates ?? 0) + 1
-            const spent = Date.now() - started
-            await new Promise((resolve) => { const t = setTimeout(resolve, Math.max(0, tick - spent)); t.unref?.() })
-          }
-          record.lastCardText = ''
-        }
-        if (text !== record.lastCardText) {
-          card.sequence += 1
-          await provider().card.update({ cardId: card.cardId, content: text, sequence: card.sequence })
-          record.lastCardText = text
-        }
-        // Footer flips from "streaming" to "done" before the card freezes.
-        try {
-          card.sequence += 1
-          await provider().card.update({
-            cardId: card.cardId,
-            content: '<font color="grey">完成</font>',
-            sequence: card.sequence,
-            elementId: 'note_1',
-          })
-        } catch { /* footer is cosmetic */ }
-        card.sequence += 1
-        try {
-          await provider().card.close({
-            cardId: card.cardId, sequence: card.sequence, summary: summaryOf(text),
-          })
-        } catch (error) {
-          // The final write is the one that must land: back off once, then retry.
-          // A single network blip used to lose the whole card; treat it like a
-        // rate limit and retry once.
-        if (!isRateLimited(error) && !isTransientNetworkError(error)) throw error
-          await new Promise((resolve) => { const t = setTimeout(resolve, 1_500); t.unref?.() })
-          card.sequence += 1
-          await provider().card.close({
-            cardId: card.cardId, sequence: card.sequence, summary: summaryOf(text),
-          })
-        }
+        await writeFinalCard(record, card, text)
         logInbound(config, {
           event: 'card', result: 'closed', sessionId, turn, cardId: card.cardId, chars: text.length,
           updates: record.updates ?? 0,
@@ -806,9 +866,9 @@ export async function finalizeTurn(ctx, config, sessionId, turn, reason) {
       } catch (error) {
         warnTo(ctx, `card finalize failed: ${errorText(error)}`)
         logInbound(config, { event: 'card', result: 'close-failed', sessionId, turn, reason: errorText(error) })
-        // A dead streaming card (Feishu closes them after ~10 minutes) must not
-        // degrade to a plain-text message: markdown would show up as raw source.
-        // Post the answer as its own fresh card instead.
+        // Last resort: a dead streaming card (Feishu closes them after ~10
+        // minutes) must not degrade to a plain-text message, because markdown
+        // would show up as raw source. Post the answer as its own fresh card.
         const posted = await postAnswerBelow(ctx, config, chatId, record, text)
         if (posted) {
           logInbound(config, {
@@ -1599,7 +1659,12 @@ export async function ensureSessionTitle(ctx, config, session, text) {
 
 const IDLE_RELEASE_CHECK_MS = 60_000
 // How far back the catch-up pull looks after a reconnect (plus the last inbound).
-const RECONCILE_WINDOW_MS = 10 * 60_000
+// A reconnect that silently loses events can stay broken for hours, so this is
+// deliberately wider than the 30 s a normal reconnect takes.
+const RECONCILE_WINDOW_MS = 30 * 60_000
+// While connected, poll the history on this cadence: a deaf socket produces no
+// ready edge, and only a pull can tell that messages are piling up unseen.
+const RECONCILE_INTERVAL_MS = 2 * 60_000
 const IDLE_PROBE_MS = 2_000
 
 /** How long a dropped long connection may stay down before the chat is told. */
@@ -2551,18 +2616,27 @@ export async function handleInboundEvent(ctx, config, data, seen) {
     log({ event: 'inbound', result: 'parse-null', messageId: String(data?.message?.message_id ?? '') })
     return
   }
-  const eventId = inbound.dedupeKey
-  if (eventId && seen.has(eventId)) {
-    log({ event: 'inbound', result: 'dedupe-hit', messageId: inbound.messageId })
+  // One message has two identities: the live event id and the message id. The
+  // catch-up pull that runs after a reconnect rebuilds history without an event
+  // id (`catchup:<message_id>`), so remembering only the live key let every
+  // reconnect replay the last ten minutes of already answered messages.
+  const seenKeys = [inbound.dedupeKey, inbound.messageId]
+    .map((value) => String(value ?? '').trim())
+    .filter(Boolean)
+  const seenAlready = seenKeys.find((key) => seen.has(key))
+  if (seenAlready) {
+    log({ event: 'inbound', result: 'dedupe-hit', messageId: inbound.messageId, key: seenAlready })
     return
   }
   // Mark an event only once it is settled. Marking before delivery loses the
   // message for good: a restart between the write and the followup leaves the id
   // "seen", so Feishu's redelivery is dropped silently.
   const markSeen = () => {
-    if (!eventId) return
-    seen.add(eventId)
-    if (seen.size > INBOUND_DEDUPE_LIMIT) seen.delete(seen.values().next().value)
+    if (seenKeys.length === 0) return
+    for (const key of seenKeys) {
+      seen.add(key)
+      if (seen.size > INBOUND_DEDUPE_LIMIT) seen.delete(seen.values().next().value)
+    }
     persistSeenEvents(config, seen)
   }
 
@@ -3626,6 +3700,7 @@ function startInbound(ctx, config) {
       // reconnect, ask the API what was said while we were away and deliver
       // anything we never saw — the only way to actually not lose a message.
       let reconcileTimer
+      let reconcileInterval
       const reconcile = async () => {
         if (disposed) return
         if (typeof provider().listRecentMessages !== 'function') return
@@ -3673,9 +3748,20 @@ function startInbound(ctx, config) {
         }, 5_000)
         reconcileTimer.unref?.()
       }
+      // A reconnect can "recover" onto a socket that answers pings but never
+      // delivers another event: no further ready edge fires, so the catch-up that
+      // hangs off that edge would never run again. A slow poll costs one REST call
+      // every couple of minutes and closes that hole; the message-id dedupe keeps
+      // already answered messages from coming back.
+      reconcileInterval = setInterval(() => {
+        if (disposed || !inboundSnapshot().ready) return
+        void reconcile()
+      }, RECONCILE_INTERVAL_MS)
+      reconcileInterval.unref?.()
       // A connection that stays down is a silent channel: a normal reconnect lands
       // in seconds, so wait a moment and only then explain what happened.
       let connectionDownAt = 0
+      let connectionDownReason = ''
       let connectionDownTimer
       const clearConnectionWatch = () => {
         if (connectionDownTimer) clearTimeout(connectionDownTimer)
@@ -3704,15 +3790,20 @@ function startInbound(ctx, config) {
             setInboundState(config, { ready: Boolean(ready), transport: 'websocket', error: String(error ?? '') })
             if (ready) {
               const downAt = connectionDownAt
+              const downReason = connectionDownReason || 'unknown'
               connectionDownAt = 0
+              connectionDownReason = ''
               clearConnectionWatch()
               warnTo(scoped, 'inbound long connection ready')
               if (downAt && !disposed) {
                 const seconds = Math.max(1, Math.round((Date.now() - downAt) / 1000))
+                // Why it dropped is the first question asked, and the recovery
+                // notice used to be the one place that did not answer it.
+                logInbound(config, { event: 'connection', result: 'recovered', seconds, reason: downReason })
                 void notifyProblem(config, {
                   key: 'connection-up',
                   title: `${channelProfile(config).label}长连接已恢复`,
-                  detail: `断开约 ${seconds} 秒后自动重连成功；这期间发来的消息可能没收到。`,
+                  detail: `断开约 ${seconds} 秒后自动重连成功（原因：${downReason}）；这期间发来的消息可能没收到。`,
                 })
               }
               void announceReady(config)
@@ -3720,7 +3811,10 @@ function startInbound(ctx, config) {
               return
             }
             if (disposed) return
-            if (!connectionDownAt) connectionDownAt = Date.now()
+            if (!connectionDownAt) {
+              connectionDownAt = Date.now()
+              connectionDownReason = String(error || 'reconnecting')
+            }
             if (error && error !== 'closed') warnTo(scoped, `inbound connection problem: ${error}`)
             if (connectionDownTimer) return
             connectionDownTimer = setTimeout(() => {
@@ -3744,6 +3838,7 @@ function startInbound(ctx, config) {
       return () => {
         disposed = true
         clearInterval(releaseTimer)
+        clearInterval(reconcileInterval)
         clearConnectionWatch()
         try { offSessionEvent?.() } catch { /* ignore */ }
         try { offInbox?.() } catch { /* ignore */ }

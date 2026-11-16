@@ -35,6 +35,15 @@ const REGION_BASE = {
 
 const TOKEN_SKEW_MS = 60_000
 const FILE_TTL_MS = 5_000
+/**
+ * How long a reconnected socket may stay silent before the client is rebuilt.
+ *
+ * `onReconnected` reports a socket that answers pings but no longer receives
+ * events; it cannot be detected from the transport, only from the absence of
+ * real events. Three minutes is long enough for a normal message burst to prove
+ * the channel alive, short enough that a dead one is rebuilt before it matters.
+ */
+const RECONNECT_SILENCE_MS = 180_000
 const tokenCache = new Map()
 let fileCache = { path: '', readAt: 0, value: {} }
 
@@ -944,7 +953,38 @@ export function createFeishuProvider(config = {}, deps = {}) {
       let restartTimer
       let readyFlag = false
       let published = ''
+      // A reconnect can hand back a socket that keeps the pong loop alive but no
+      // longer receives events: `onReconnected` then reports "ready" while the
+      // channel is deaf, and outbound REST keeps working, so nothing else notices.
+      // Track the last real event and rebuild once when a reconnect stays silent.
+      let lastEntryAt = Date.now()
+      let verifyTimer
+      let verifiedRebuild = false
+      // Set while an intentional rebuild closes the socket, so its own close does
+      // not count as a fresh outage and re-arm the verification forever.
+      let selfClosing = false
+      const clearVerify = () => {
+        if (verifyTimer) clearTimeout(verifyTimer)
+        verifyTimer = undefined
+      }
+      const armInboundVerify = () => {
+        if (disposed) return
+        clearVerify()
+        verifyTimer = setTimeout(() => {
+          verifyTimer = undefined
+          if (disposed || !readyFlag || verifiedRebuild) return
+          if (Date.now() - lastEntryAt < RECONNECT_SILENCE_MS) return
+          verifiedRebuild = true
+          // A fresh client is the only reliable fix: the old socket's event
+          // subscription is what went stale, and reusing it keeps it dead.
+          log({ event: 'channel', result: 'rebuild', reason: 'no inbound after reconnect' })
+          selfClosing = true
+          void startClient().finally(() => { selfClosing = false })
+        }, RECONNECT_SILENCE_MS)
+        verifyTimer.unref?.()
+      }
       const publish = (ready, error = '') => {
+        const wasDown = published.startsWith('down:')
         readyFlag = ready
         // One ready line per transition: SDK onReady and onReconnected both fire
         // on the first connect, and duplicates made the log look like churn.
@@ -952,9 +992,16 @@ export function createFeishuProvider(config = {}, deps = {}) {
         if (key === published) return
         published = key
         onState?.({ ready, error })
+        if (!ready) {
+          clearVerify()
+          if (!selfClosing) verifiedRebuild = false
+        } else if (wasDown) {
+          armInboundVerify()
+        }
       }
       const dispatcher = new Lark.EventDispatcher({}).register({
         'im.message.receive_v1': async (data) => {
+          lastEntryAt = Date.now()
           // Prove the event reached the plugin. Without this line a message lost
           // before our filters is indistinguishable from one that never arrived —
           // exactly the situation that made the field report impossible to read.
@@ -1054,6 +1101,7 @@ export function createFeishuProvider(config = {}, deps = {}) {
       return () => {
         disposed = true
         if (restartTimer) clearTimeout(restartTimer)
+        clearVerify()
         if (client) log({ event: 'channel', result: 'client-close', client: clientLabel })
         try { client?.close?.() } catch { /* ignore */ }
         publish(false, 'closed')
