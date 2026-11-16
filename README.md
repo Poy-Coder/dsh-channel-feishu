@@ -8,9 +8,9 @@
 
 用的是你自己在飞书开放平台新建的自建应用（独立机器人），不和别的通道共用事件。
 
-**配套**：
+**配套（建议一并安装）**：
 
-- [`dsh-im-indicator`](https://github.com/Poy-Coder/dsh-im-indicator) —— 在 DSH 左侧会话列表标出「哪条会话正被通道驱动」，一行胶囊 + 一个状态点，零依赖 7 kB；
+- [`dsh-im-indicator`](https://github.com/Poy-Coder/dsh-im-indicator) —— **推荐装**：在 DSH 左侧会话列表直接看出「哪条会话正被飞书驱动、它现在在回答还是已完成」，一行胶囊 + 一个状态点，零依赖约 7 kB；
 - [`dsh-channel-wechat-ilink`](https://github.com/Poy-Coder/dsh-channel-wechat-ilink) —— 同一套框架的微信通道，可与飞书同时在线。
 
 ## 为什么这么设计
@@ -53,7 +53,7 @@ dsh plugin add dsh-channel-feishu
 
 ```bash
 dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu
-dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.16/dsh-channel-feishu-0.9.16.tgz
+dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.17/dsh-channel-feishu-0.9.17.tgz
 ```
 
 依赖必须用扁平结构装（非 ASCII 目录下 pnpm 的软链会把路径写坏）：`pnpm install --node-linker=hoisted`。
