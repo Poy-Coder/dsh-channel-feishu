@@ -53,7 +53,7 @@ dsh plugin add dsh-channel-feishu
 
 ```bash
 dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu
-dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.19/dsh-channel-feishu-0.9.19.tgz
+dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.20/dsh-channel-feishu-0.9.20.tgz
 ```
 
 依赖必须用扁平结构装（非 ASCII 目录下 pnpm 的软链会把路径写坏）：`pnpm install --node-linker=hoisted`。
@@ -150,11 +150,14 @@ node scripts/wechat-login.mjs --qr   # 二维码直接画在终端，并落一�
 
 回 `2` 就是第二项；回「两个都不合适，我补充一句」会被当成补充答案交给模型；回「跳过」跳过。**不用加前缀、不用记命令**——插件按「能对上选项就用，对不上就当补充」处理。
 
-**进度**：收到消息立刻显示「对方正在输入…」；超过 `textProgressSeconds` 秒还没有正文，才补一条 `还在跑 · 正在执行 pwsh · 已调用 2 个工具 · 已用时 35s`。
+**进度**：收到消息立刻显示「对方正在输入…」，**每 5 秒续期一次**（协议里的输入状态会过期，官方客户端同样 5 秒续一次）；超过 `textProgressSeconds` 秒还没有正文，才补一条 `还在跑 · 正在执行 pwsh · 已调用 2 个工具 · 已用时 35s`。
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `textProgressSeconds` | `30` | 多少秒没正文就发一条进度；`0` = 关闭进度（只留输入状态）；嫌 30 秒太频繁就调大，比如 60 / 120 |
+| `typingRenewSeconds` | `5` | 输入状态多久续期一次；`0` = 每轮只发一次（长任务中途可能看不到输入状态） |
+| `textProgressSeconds` | `30` | 多少秒没正文就发一条进度；`0` = 关闭进度气泡（只剩「正在输入」）；嫌 30 秒太频繁就调大，比如 60 / 120 |
+
+想做到「全程只有正在输入、没有任何进度气泡」，把 `textProgressSeconds` 设成 `0` 即可；`typingRenewSeconds` 保持 5 秒，长任务期间输入状态不会消失。
 
 同一条进度不重复：只有工具或调用次数变了才发新的，间隔至少 3 分钟、每轮最多 3 条；正文一开始就不再发进度。飞书通道忽略这个参数（它用卡片每 10 秒刷新）。
 
