@@ -2969,6 +2969,19 @@ export async function handleInboundEvent(ctx, config, data, seen) {
     }
   } catch (error) {
     const reason = errorText(error)
+    // The followup can fail for the same transient reason: the session's writer
+    // is busy (a turn already running, the GUI writing another message). Queue
+    // it instead of losing it, because the provider cursor already moved on.
+    if (isTransientInboundFailure(reason)) {
+      const depth = queuePendingInbound(config, {
+        keys: seenKeys, text, chatId, senderId,
+        messageId: inbound.messageId ?? '', sessionId, at: Date.now(), reason,
+      })
+      warnTo(ctx, `inbound delivery blocked for session "${sessionId}" (${reason}); retrying`)
+      log({ event: 'inbound', result: 'queued-on-delivery', reason, senderId, chatId, sessionId, depth })
+      if (resolved.created) await attachToFeishuWorkspace(ctx, config, sessionId)
+      return
+    }
     warnTo(ctx, `inbound delivery failed for session "${sessionId}": ${reason}`)
     log({ event: 'inbound', result: 'error', reason, senderId, chatId, sessionId, via: resolved.via })
     // The message never reached the session: without this the chat just looks

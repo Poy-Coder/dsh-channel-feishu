@@ -192,6 +192,12 @@ Tell them, in this order:
   minutes rebuilds the client, and while connected the plugin polls the chat history every
   two minutes (`reconcile`). Both rely on the message-id dedupe, so a rebuilt connection
   cannot answer the same message twice.
+- **WeChat has no history API, so it fakes one with saved cursors.** `getUpdates` ignores
+  an empty cursor's backlog but DOES answer an older cursor with the messages it already
+  passed (verified live), so `saveWechatCursor` keeps one cursor per minute for two days
+  and `listRecentMessages` cold-reads the cursor that predates the reconcile window. That
+  closes the gap the Feishu catch-up covers through the messages API. The cold read never
+  writes the live cursor back, and it is throttled to one call per five minutes.
 - **CoT events are byte-bounded.** The platform counts UTF-8 bytes; a long Chinese
   reasoning block must be chunked (the plugin does this). `10001 event[N] content too
   long` means the payload exceeded the budget.

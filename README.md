@@ -53,7 +53,7 @@ dsh plugin add dsh-channel-feishu
 
 ```bash
 dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu
-dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.22/dsh-channel-feishu-0.9.22.tgz
+dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.23/dsh-channel-feishu-0.9.23.tgz
 ```
 
 依赖必须用扁平结构装（非 ASCII 目录下 pnpm 的软链会把路径写坏）：`pnpm install --node-linker=hoisted`。
@@ -164,6 +164,16 @@ node scripts/wechat-login.mjs --qr   # 二维码直接画在终端，并落一�
 **正文**：**一轮一条完整消息**，不拆段、不做流式帧（客户端限制，实测无法原地刷新）。只有超过 1800 字的回答才按上限拆续条；发送失败会隔 800ms 重试一次。
 
 **投递可靠性**：`context_token` 由入站消息签发且会过期，过期后发送返回 `ret=-2 prepare failed`；插件不会删除已存的 token（删了会让后续回复彻底发不出去），失败时只做一次无 token 重试并记录 `finish-failed`。
+
+**补拉（漏消息兜底）**：iLink 的 `get_updates_buf` 游标是单调的，轮询一旦卡住或服务端提前返回空响应，连接看起来正常但消息就是不进来。插件为此做了三层：
+
+| 机制 | 作用 |
+|---|---|
+| 轮询看门狗 | `getupdates` 超过 120 秒没完成 → 重建长轮询 |
+| 空闲游标重置 | 20 分钟没消息 → 用空游标重新开始（空游标只收新消息） |
+| **冷读补拉** | 每 2 分钟 reconcile 时，用**记录下来的旧游标**再拉一次过去 10 分钟的消息，按 `message_id` 去重后补投 |
+
+冷读之所以可行，是因为实测确认：**旧游标会重放它已经越过的消息**（空游标不会）。游标历史每分钟采样一次、保留 2 天，写在 `wechat-sync.json` 的 `history` 里；冷读不会写回当前游标，所以不会让轮询跳读。想手动验证可以用 `node scripts/wechat-history-probe.mjs --cursor=<旧游标>`。
 
 ### 两个通道各用各的工作区
 
