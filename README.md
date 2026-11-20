@@ -53,7 +53,7 @@ dsh plugin add dsh-channel-feishu
 
 ```bash
 dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu
-dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.28/dsh-channel-feishu-0.9.28.tgz
+dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.29/dsh-channel-feishu-0.9.29.tgz
 ```
 
 依赖必须用扁平结构装（非 ASCII 目录下 pnpm 的软链会把路径写坏）：`pnpm install --node-linker=hoisted`。
@@ -298,6 +298,45 @@ allowedUsers:
 | `/think` | 看/切思考强度 |
 
 命令在插件侧拦截，不进模型、不占回合。
+
+## 审批：在聊天里点不了？那就回一句话
+
+通道回合是无人值守的，而权限预设 `workspace-write` 带 `approval: ask`——模型一旦要越界写文件，DSH 会等一个人点「允许」，而聊天窗口里没有那个按钮。以前这一轮就卡在那里，直到超时。
+
+现在插件会把这个审批**转到聊天里**：
+
+```
+飞书通道需要你批准一次工具调用
+工具：pwsh
+原因：写入工作区以外的路径
+
+回复 1 允许这一次，回复 2 拒绝。
+超过 5 分钟没回复，按拒绝处理。
+```
+
+- 回 `1` / `允许` / `同意` → `allowed-once`（**只放行这一次**）；
+- 回 `2` / `拒绝` / `取消` → `rejected`；
+- 回别的内容 → **不当成审批答案**，照常交给模型（你可以先解释为什么需要它）；
+- 超时或没有回复 → **按拒绝处理**——沉默永远不等于同意。
+
+配置：
+
+| 配置 | 默认 | 说明 |
+|---|---|---|
+| `approvalPrompts` | `true` | 关掉则由 DSH 原本的审批路径处理（无人看守时会卡住） |
+| `approvalTimeoutSeconds` | `300` | 多久没回复按拒绝处理 |
+
+## 长回答发不出去时不会静默
+
+微信侧一轮回答是一条完整消息，只有超过 1800 字才拆续条。每一段**独立重试**（0 / 0.8s / 2s / 5s 退避），上下文 token 过期（`ret=-2`、`ret=100`）会去掉 token 再试一次。
+
+如果某一段最终还是发不出去，你会在聊天里收到一句明确说明：
+
+```
+（这条回答没有完整发出去，可能是网络原因。可以让我重发一次，或在桌面端查看完整内容。）
+```
+
+而不是"看到前半段、后半段永远不来、也没有任何提示"。
 
 ## 日志
 
