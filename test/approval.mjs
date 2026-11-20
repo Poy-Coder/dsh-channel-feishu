@@ -57,16 +57,19 @@ test('the pending card offers exactly allow and deny', () => {
   assert.match(text, /写入工作区以外的路径/)
 })
 
-test('the settled card keeps no buttons and states the outcome', () => {
+test('the settled card keeps no buttons and states the outcome once', () => {
   const allowed = approvalCardJson({ toolName: 'pwsh', decision: 'allow' })
   assert.equal(buttonsOf(allowed).length, 0)
   assert.equal(allowed.header.template, 'green')
-  assert.match(JSON.stringify(allowed.body), /已允许这一次/)
+  // 结果只出现在头部：正文再写一遍是冗余，用户已经提过这点
+  assert.equal(allowed.header.title.content, '已允许这一次')
+  assert.doesNotMatch(JSON.stringify(allowed.body), /已允许这一次/)
 
   const denied = approvalCardJson({ toolName: 'pwsh', decision: 'deny' })
   assert.equal(buttonsOf(denied).length, 0)
   assert.equal(denied.header.template, 'red')
-  assert.match(JSON.stringify(denied.body), /已拒绝/)
+  assert.equal(denied.header.title.content, '已拒绝')
+  assert.doesNotMatch(JSON.stringify(denied.body), /已拒绝/)
 })
 
 test('the status line is patchable and streaming stays open', () => {
