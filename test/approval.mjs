@@ -11,10 +11,17 @@ import assert from 'node:assert/strict'
 import { approvalCardJson, parseApprovalAnswer } from '../index.js'
 
 test('a clear yes grants exactly one call', () => {
-  for (const text of ['1', 'y', 'yes', 'ok', 'OK', '允许', '同意', '可以', '好', '批准', '行']) {
+  for (const text of ['1', 'y', 'yes', '允许', '同意', '可以', '批准']) {
     assert.equal(parseApprovalAnswer(text), 'allow', `${text} should allow`)
   }
   assert.equal(parseApprovalAnswer('  1  '), 'allow')
+})
+
+test('casual agreement is not consent', () => {
+  // 审批待定时用户随口说的「好」「行」「ok」不能被当成放行
+  for (const text of ['好', '好的', '行', 'ok', 'OK', '嗯', '可以吧？']) {
+    assert.equal(parseApprovalAnswer(text), undefined, `${text} must not grant`)
+  }
 })
 
 test('a clear no refuses', () => {

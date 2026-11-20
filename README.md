@@ -53,7 +53,7 @@ dsh plugin add dsh-channel-feishu
 
 ```bash
 dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu
-dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.33/dsh-channel-feishu-0.9.33.tgz
+dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.34/dsh-channel-feishu-0.9.34.tgz
 ```
 
 依赖必须用扁平结构装（非 ASCII 目录下 pnpm 的软链会把路径写坏）：`pnpm install --node-linker=hoisted`。
@@ -332,8 +332,11 @@ allowedUsers:
 超过 5 分钟没回复，按拒绝处理。
 ```
 
-- 回 `1` / `允许` / `同意` → `allowed-once`（**只放行这一次**）；
+- 回 `1` / `允许` / `同意` / `可以` / `批准` → `allowed-once`（**只放行这一次**）；
 - 回 `2` / `拒绝` / `取消` → `rejected`；
+- **`好` / `行` / `ok` 不算同意**：审批挂起时它们最可能是你随口接话，读成放行等于替你做决定；
+- 如果同一聊天里既有一条待审批、又有一个待回答的问题，回复会先被审批接管，插件会提示「还有一条审批在等你」，处理完再回答问题——不会把序号误喂给模型；
+- 等待审批期间微信**不再续期「正在输入」**（那时并没有在生成内容）。
 - 回别的内容 → **不当成审批答案**，照常交给模型（你可以先解释为什么需要它）；
 - 超时或没有回复 → **按拒绝处理**——沉默永远不等于同意。
 
