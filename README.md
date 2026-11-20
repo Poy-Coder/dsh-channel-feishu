@@ -53,7 +53,7 @@ dsh plugin add dsh-channel-feishu
 
 ```bash
 dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu
-dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.31/dsh-channel-feishu-0.9.31.tgz
+dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.32/dsh-channel-feishu-0.9.32.tgz
 ```
 
 依赖必须用扁平结构装（非 ASCII 目录下 pnpm 的软链会把路径写坏）：`pnpm install --node-linker=hoisted`。
@@ -316,7 +316,7 @@ allowedUsers:
 ```
 
 - 点按钮即完成，**不用切输入法打数字**；
-- 点完卡片原地更新成「已允许这一次」/「已拒绝」，对话里留下明确记录；
+- 点完**整张卡片替换**成结果状态：头部变绿「已允许这一次」或变红「已拒绝」，按钮消失——不是只改一行文字，你能一眼看出点击生效了；
 - 按钮带的是结构化值（`a: allow|deny`），不像文本要靠正则猜意图。
 
 卡片发不出去时自动退回文字，两种方式等效。
