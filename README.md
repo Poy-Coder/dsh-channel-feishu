@@ -36,7 +36,7 @@
 - **双向通道**：飞书私聊 → DSH 会话；一轮结束把答复自动发回原聊天，不需要模型调工具
 - **流式卡片**：思考过程单独一条消息，正文卡片逐字出现，底栏依次是 `等待回答 → 流式输出中 → 完成`
 - **不会静默**：工具开始/结束时卡片立刻更新，长任务期间每 10 秒刷新一次进度——`正在执行 feishu_send_file · 已调用 3 个工具 · 已用时 42s`，不用猜它是卡住了还是在干活
-- **出错会说话**：回合失败、消息没投递到会话、长连接断开超过 20 秒、进程半途退出，都会往飞书推一条写明原因的通知，而不是安静地少一条回复（`problemNotices: false` 可关）
+- **出错会说话，但不吵**：回合失败、消息没投递到会话、进程半途退出，会往飞书推一条写明原因的通知（`problemNotices: false` 可关）。长连接断开要**持续 90 秒**以上才通知——正常重连只要几秒，那种抖动你根本察觉不到，所以不发；只有断开期间才补发“已恢复”，且连接类通知最多 10 分钟一条。同一段时间里断开 3 次以上，只发一条「连接不稳定」而不是一串卡片
 - **问答卡**：`ask_user_question` 渲染成卡片，选项文字整行显示、下面一排数字按钮作答；多题**逐题发**，答完才发下一题；选项都不合适就点「补充」再直接回复文字，答完的答复落在问答卡下方
 - **附件**：入站图片和 `file` 消息（pdf/docx/xlsx/zip/音频）都下载到 `<workspacePath>/attachments/`，消息里附上绝对路径
 - **会话自动创建**：全新安装时，第一条飞书消息会自动建会话和「飞书」工作区，不需要先手填 `sessionId`
@@ -53,7 +53,7 @@ dsh plugin add dsh-channel-feishu
 
 ```bash
 dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu
-dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.25/dsh-channel-feishu-0.9.25.tgz
+dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.26/dsh-channel-feishu-0.9.26.tgz
 ```
 
 依赖必须用扁平结构装（非 ASCII 目录下 pnpm 的软链会把路径写坏）：`pnpm install --node-linker=hoisted`。

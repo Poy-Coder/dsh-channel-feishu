@@ -193,6 +193,11 @@ Tell them, in this order:
   minutes rebuilds the client, and while connected the plugin polls the chat history every
   two minutes (`reconcile`). Both rely on the message-id dedupe, so a rebuilt connection
   cannot answer the same message twice.
+- **Connection news is throttled, not streamed.** A drop has to last 90 s before the chat
+  is told (every drop seen so far healed in 8–24 s); the "recovered" card is sent only when
+  the drop was announced, so a self-healing blip produces no message at all. Connection
+  notices share a 10-minute floor, and three drops inside a 10-minute window collapse into a
+  single "connection unstable" card instead of a pair per drop.
 - **WeChat has no history API, so it fakes one with saved cursors.** `getUpdates` ignores
   an empty cursor's backlog but DOES answer an older cursor with the messages it already
   passed (verified live), so `saveWechatCursor` keeps one cursor per minute for two days
