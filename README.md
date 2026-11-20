@@ -53,7 +53,7 @@ dsh plugin add dsh-channel-feishu
 
 ```bash
 dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu
-dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.24/dsh-channel-feishu-0.9.24.tgz
+dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.25/dsh-channel-feishu-0.9.25.tgz
 ```
 
 依赖必须用扁平结构装（非 ASCII 目录下 pnpm 的软链会把路径写坏）：`pnpm install --node-linker=hoisted`。
@@ -240,13 +240,13 @@ node <profile>/node_modules/dsh-channel-feishu/scripts/setup.mjs
     problemNotices: true        # 出错/崩溃时往飞书推原因；关掉只剩日志
     textProgressSeconds: 30     # 纯文本通道（微信）的进度间隔；0 = 不发进度
     mirrorUserMessages: true    # 桌面端消息转发到飞书
-    permissionPreset: danger-full-access   # 无人值守没人能点审批；嫌大改 workspace-write
+    permissionPreset: workspace-write    # 默认只写工作区；要全自动无人值守再改 danger-full-access
     applyPermissionPreset: true
     region: feishu
     logLevel: info              # debug | info | warn | error
 ```
 
-`permissionPreset` 默认 `danger-full-access`：飞书是无值守通道，卡在授权确认上就永远没人点。
+`permissionPreset` 默认 **`workspace-write`**：通道回合无人值守，这个预设把写入限制在工作区内（读不受限），越界操作会请求批准——而 IM 里没有人能点那个批准，所以回合会停在那里而不是悄悄提权。确实需要「越界也能自动写」时，显式改成 `danger-full-access`（沙箱全开 + 永不询问），这个选择不会被默认接管。
 
 ### 3. 飞书侧
 
@@ -257,15 +257,16 @@ node <profile>/node_modules/dsh-channel-feishu/scripts/setup.mjs
 
 ## 允许名单
 
-`allowedUsers` 为空时**不是对所有人开放**：第一个给机器人发消息的人会被记为该通道的 owner，
-之后其他人发消息会被拒绝并收到一条说明。想换人或放开多人，显式写出 open_id：
+`allowedUsers` 为空时**不是对所有人开放**，但也**不是安全默认**：第一个给机器人发消息的人会被记为该通道的 owner，之后其他人发消息会被拒绝并收到一条说明。
+
+这意味着把机器人拉进群、或者链接被人转发出去时，**第一个说话的人就成了主人**。生产环境请显式写出 open_id：
 
 ```yaml
 allowedUsers:
   - "ou_xxxxxxxxxxxxxxxx"
 ```
 
-owner 记在通道状态文件里，删掉状态文件里的 `owner` 字段即可重新绑定。
+微信侧不会有这个窗口：扫码登录时就已经把登录账号绑定为 owner，第一条消息之前权限就定好了。飞书侧的 owner 记在通道状态文件里，删掉状态文件里的 `owner` 字段即可重新绑定。
 
 ## 会话
 

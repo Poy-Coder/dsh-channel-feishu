@@ -743,7 +743,7 @@ const statusReport = await statusText(
 )
 assert.match(statusReport, /会话：session-x/)
 assert.match(statusReport, /工作区：C:\\tmp\\feishu-ws/)
-assert.match(statusReport, /权限：danger-full-access/)
+assert.match(statusReport, /权限：workspace-write/)
 assert.match(statusReport, /目标群：oc_x/)
 
 // 17. Thinking process + reaction acknowledgement: CoT events are well-formed and

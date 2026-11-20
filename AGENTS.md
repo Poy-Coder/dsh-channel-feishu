@@ -18,7 +18,8 @@ are all in place, and only you can walk the user through that.
 2. **Never paste an app secret into chat, a commit, or `cordis.patch.yml`.** Put it in the
    DSH credentials store or `~/.dsh/feishu-channel.json` (§4).
 3. **Ask before enabling inbound.** Enabling it lets anyone in the Feishu chat drive the
-   local agent, and the plugin switches that workspace's sessions to `danger-full-access`.
+   local agent, and the plugin applies its `permissionPreset` to that workspace's sessions
+   (default `workspace-write`, which still lets the model write anywhere inside the workspace).
 4. **Report back to the user** with what you configured, what you verified, and what they
    still must do (§7).
 
@@ -111,7 +112,7 @@ Add to the profile's `cordis.patch.yml` (or the plugin's settings form):
     sessionId: session-<a fresh uuid>   # created on the first inbound message
     allowedUsers: ["ou_…"]              # the human's open_id; empty = first sender binds
     workspacePath: ""                   # empty → a non-system-drive default
-    permissionPreset: danger-full-access # session policy inside that workspace
+    permissionPreset: workspace-write     # session policy inside that workspace
 ```
 
 Ask the user for their **open_id** first (`feishu_channel_status` does not expose it; the
@@ -127,8 +128,8 @@ The three defaults are security-relevant, so state them when you enable inbound:
 | Default | Meaning |
 |---|---|
 | `inboundEnabled: false` | nothing listens until the user opts in |
-| `allowedUsers: []` | first sender (Feishu) / logged-in account (WeChat) becomes owner |
-| `permissionPreset: danger-full-access` + `applyPermissionPreset: true` | unattended turns cannot answer approvals, so channel sessions get full access; `workspace-write` is the milder choice |
+| `allowedUsers: []` | first sender (Feishu) / logged-in account (WeChat) becomes owner. Not "open to everyone", but not a safe default either: whoever speaks first in a chat that was forwarded or added to a group becomes the owner. Prefer listing the open_id. |
+| `permissionPreset: workspace-write` + `applyPermissionPreset: true` | writes stay inside the workspace. The preset also carries `approval: ask`, and an IM turn has nobody to answer it, so an out-of-workspace action **stalls the turn** instead of escalating silently. `danger-full-access` removes both the confinement and the prompt; a deployment that needs unattended out-of-workspace writes sets it explicitly. |
 
 ## 5. What the user will see
 
