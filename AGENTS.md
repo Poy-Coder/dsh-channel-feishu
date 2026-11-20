@@ -135,7 +135,7 @@ The three defaults are security-relevant, so state them when you enable inbound:
 | `inboundEnabled: false` | nothing listens until the user opts in |
 | `allowedUsers: []` | first sender (Feishu) / logged-in account (WeChat) becomes owner. Not "open to everyone", but not a safe default either: whoever speaks first in a chat that was forwarded or added to a group becomes the owner. Prefer listing the open_id. |
 | `permissionPreset: workspace-write` + `applyPermissionPreset: true` | writes stay inside the workspace. The preset also carries `approval: ask`; the plugin now answers that in the chat (see below), so an out-of-workspace action asks instead of silently escalating. `danger-full-access` removes both the confinement and the prompt; a deployment that needs unattended out-of-workspace writes sets it explicitly. |
-| `approvalPrompts: true` + `approvalTimeoutSeconds: 300` | an approval that needs permission is asked in the chat: reply `1` to allow exactly once, `2` to refuse. No reply past the timeout counts as refused — silence is never consent. Anything other than a clear yes/no is left to the agent as an ordinary message. |
+| `approvalPrompts: true` + `approvalTimeoutSeconds: 300` | an approval that needs permission is asked in the chat — **as an interactive card on Feishu** (buttons `允许这一次` / `拒绝`, patched in place once settled) and as a numbered text prompt on WeChat. Text replies still work on both. No reply past the timeout counts as refused — silence is never consent. Anything other than a clear yes/no is left to the agent as an ordinary message. |
 
 ## 5. What the user will see
 

@@ -53,7 +53,7 @@ dsh plugin add dsh-channel-feishu
 
 ```bash
 dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu
-dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.30/dsh-channel-feishu-0.9.30.tgz
+dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.31/dsh-channel-feishu-0.9.31.tgz
 ```
 
 依赖必须用扁平结构装（非 ASCII 目录下 pnpm 的软链会把路径写坏）：`pnpm install --node-linker=hoisted`。
@@ -299,14 +299,32 @@ allowedUsers:
 
 命令在插件侧拦截，不进模型、不占回合。
 
-## 审批：在聊天里点不了？那就回一句话
+## 审批：在聊天里点不了？那就点卡片 / 回一句话
 
 通道回合是无人值守的，而权限预设 `workspace-write` 带 `approval: ask`——模型一旦要越界写文件，DSH 会等一个人点「允许」，而聊天窗口里没有那个按钮。以前这一轮就卡在那里，直到超时。
 
-现在插件会把这个审批**转到聊天里**：
+### 飞书：交互卡片
 
 ```
-飞书通道需要你批准一次工具调用
+┌────────────────────────────────┐
+│ 需要你批准一次工具调用           │
+│ 工具：pwsh                     │
+│ 原因：写入工作区以外的路径        │
+│ 等待你的批准…                   │
+│  [ 允许这一次 ]   [ 拒绝 ]      │
+└────────────────────────────────┘
+```
+
+- 点按钮即完成，**不用切输入法打数字**；
+- 点完卡片原地更新成「已允许这一次」/「已拒绝」，对话里留下明确记录；
+- 按钮带的是结构化值（`a: allow|deny`），不像文本要靠正则猜意图。
+
+卡片发不出去时自动退回文字，两种方式等效。
+
+### 微信：纯文本编号（没有卡片能力）
+
+```
+微信通道需要你批准一次工具调用
 工具：pwsh
 原因：写入工作区以外的路径
 
