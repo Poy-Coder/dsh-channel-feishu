@@ -53,7 +53,7 @@ dsh plugin add dsh-channel-feishu
 
 ```bash
 dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu
-dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.27/dsh-channel-feishu-0.9.27.tgz
+dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.28/dsh-channel-feishu-0.9.28.tgz
 ```
 
 依赖必须用扁平结构装（非 ASCII 目录下 pnpm 的软链会把路径写坏）：`pnpm install --node-linker=hoisted`。
@@ -61,8 +61,18 @@ dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download
 > **更新插件后必须重启本机的 DSH**：通道代码在 DSH 启动时加载，没有热更新；
 > 只 `dsh plugin add <新版本>` 而不重启，跑的还是旧代码（`feishu_channel_status` 里的版本号也还是旧的）。
 
-安装包的 bundle patch 会插入通道行，**入站默认关闭**（`inboundEnabled: false`），装完重启一次即可；
+安装包的 bundle patch 会插入通道行，**入站默认关闭**（`inboundEnabled: false`），下面的五步把它打开；
 第一条飞书消息会自动建会话和「飞书」工作区，不需要先手填 `sessionId`。
+
+### 第一次安装：五步
+
+1. **装插件**（上面那条 `dsh plugin add`），装完先不要发消息——入站还没开。
+2. **把入站打开**：在 profile 的 `cordis.patch.yml` 找到 `feishu-channel` 那行，把 `inboundEnabled: false` 改成 `true`。
+   不改这一行，重启后通道是「装好了但没在听」，发消息不会有任何反应（会收到一条提醒说明这点）。
+3. **确认允许名单**：`allowedUsers` 留空也行，但那样是「第一个给机器人发消息的人成为主人」；想指定就填自己的 `open_id`。
+4. **重启 DSH**（插件在启动时加载，没有热更新）。
+5. **在飞书里给机器人发一句话**，然后看两件事：会话列表出现「飞书」工作区下的新会话、卡片里开始出字。
+   如果没反应，`/status` 会告诉你入站、会话、权限、模型分别是什么状态。
 
 ### 开启入站前先看这三个默认值
 
@@ -70,7 +80,7 @@ dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download
 |---|---|---|
 | `inboundEnabled` | `false` | 打开后，应用可见范围内的任何人都能驱动本地 Agent；确认允许名单后再开启 |
 | `allowedUsers` | `[]` | 空不是"谁都可以"：第一个发消息的人会**绑定**该通道，之后其他人被拒。想指定就显式列出 open_id |
-| `permissionPreset` / `applyPermissionPreset` | `danger-full-access` / `true` | 无人值守时没人能点审批，所以通道工作区里的会话会切到这个预设；觉得太大就改成 `workspace-write` 或关掉 apply |
+  | `permissionPreset` / `applyPermissionPreset` | `workspace-write` / `true` | 通道工作区里的会话只允许写工作区内；越界写会请求批准，而聊天窗口里没人能点，所以那一轮会停住而不是悄悄提权。要「越界也自动写」就显式改 `danger-full-access` |
 
 
 凭据写到 `~/.dsh/feishu-channel.json`（或设 `FEISHU_APP_ID` / `FEISHU_APP_SECRET`），
