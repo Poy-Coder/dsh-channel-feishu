@@ -53,7 +53,7 @@ dsh plugin add dsh-channel-feishu
 
 ```bash
 dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu
-dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.26/dsh-channel-feishu-0.9.26.tgz
+dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.27/dsh-channel-feishu-0.9.27.tgz
 ```
 
 依赖必须用扁平结构装（非 ASCII 目录下 pnpm 的软链会把路径写坏）：`pnpm install --node-linker=hoisted`。
@@ -330,3 +330,13 @@ allowedUsers:
 | 插件加载失败、工具全消失 | 检查 `package.json` 是否被写成带 BOM 的 UTF-8 |
 | 发文件报权限错误 | 应用要开 `im:resource` 上传权限 |
 | 同一 App 两条长连接 | 只能有一个通道插件用这个 App，旧通道要先 `disabled: true` |
+
+## 遇到问题
+
+发现 bug、行为不符合预期，或者想加某个功能，直接开 issue：
+
+- 飞书通道：<https://github.com/Poy-Coder/dsh-channel-feishu/issues>
+- 微信通道：<https://github.com/Poy-Coder/dsh-channel-wechat-ilink/issues>
+- 会话列表指示器：<https://github.com/Poy-Coder/dsh-im-indicator/issues>
+
+开之前先看一眼日志（`~/.dsh/feishu-inbound.log`、`~/.dsh/wechat-inbound.log`），把里面相关的几行贴进 issue——JSON 每行一条，带上 `event` / `result` / `reason` 就足够定位了。凭据不要贴（`botToken`、`appSecret`、`context_token` 都算）。
