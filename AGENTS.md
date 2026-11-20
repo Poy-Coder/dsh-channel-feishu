@@ -22,6 +22,11 @@ are all in place, and only you can walk the user through that.
    (default `workspace-write`, which still lets the model write anywhere inside the workspace).
 4. **Report back to the user** with what you configured, what you verified, and what they
    still must do (§7).
+5. **A code change ships with its documentation.** Any behavior a user can observe — a new
+   default, a new notice, a new config key, a changed message — updates `README.md` (user
+   facing) and this file (agent facing) **in the same release**. A release whose notes
+   describe behavior the docs do not mention is incomplete, and a doc-only fix is still a
+   release: the published README on npm and the GitHub repo both come from these files.
 
 ## 1. Install
 
@@ -129,7 +134,8 @@ The three defaults are security-relevant, so state them when you enable inbound:
 |---|---|
 | `inboundEnabled: false` | nothing listens until the user opts in |
 | `allowedUsers: []` | first sender (Feishu) / logged-in account (WeChat) becomes owner. Not "open to everyone", but not a safe default either: whoever speaks first in a chat that was forwarded or added to a group becomes the owner. Prefer listing the open_id. |
-| `permissionPreset: workspace-write` + `applyPermissionPreset: true` | writes stay inside the workspace. The preset also carries `approval: ask`, and an IM turn has nobody to answer it, so an out-of-workspace action **stalls the turn** instead of escalating silently. `danger-full-access` removes both the confinement and the prompt; a deployment that needs unattended out-of-workspace writes sets it explicitly. |
+| `permissionPreset: workspace-write` + `applyPermissionPreset: true` | writes stay inside the workspace. The preset also carries `approval: ask`; the plugin now answers that in the chat (see below), so an out-of-workspace action asks instead of silently escalating. `danger-full-access` removes both the confinement and the prompt; a deployment that needs unattended out-of-workspace writes sets it explicitly. |
+| `approvalPrompts: true` + `approvalTimeoutSeconds: 300` | an approval that needs permission is asked in the chat: reply `1` to allow exactly once, `2` to refuse. No reply past the timeout counts as refused — silence is never consent. Anything other than a clear yes/no is left to the agent as an ordinary message. |
 
 ## 5. What the user will see
 
