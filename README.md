@@ -1,5 +1,10 @@
 # dsh-channel-feishu
 
+> **什么时候该用它**：想把 DSH 接到飞书、在飞书里和本机 Agent 说话、用手机通过飞书驱动电脑上的 DSH（Feishu / Lark 通道）。
+> **一条命令装**：`dsh plugin add dsh-channel-feishu`
+> **装完是什么样**：飞书里给机器人发一句话 → 收到流式卡片回答；左侧会话列表多一条「飞书会话」。
+> **需要准备**：一个飞书自建应用（appId / appSecret）+ 开启长连接事件订阅；入站默认关闭，需显式打开。
+
 给 DeepSeek Harness（DSH）装一条**专用飞书通道**：DSH 里的 Agent 可以直接在飞书里聊，
 每轮答复自动回传成流式卡片，收到的图片和文件落进工作区，需要你拍板时发交互式问答卡。
 
@@ -53,7 +58,7 @@ dsh plugin add dsh-channel-feishu
 
 ```bash
 dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu
-dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.34/dsh-channel-feishu-0.9.34.tgz
+dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.35/dsh-channel-feishu-0.9.35.tgz
 ```
 
 依赖必须用扁平结构装（非 ASCII 目录下 pnpm 的软链会把路径写坏）：`pnpm install --node-linker=hoisted`。

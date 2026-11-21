@@ -1,8 +1,8 @@
 {
   "name": "dsh-channel-feishu",
-  "version": "0.9.34",
+  "version": "0.9.35",
   "type": "module",
-  "description": "Feishu/Lark (飞书) channel for DeepSeek Harness: a chat bound to a DSH session, with streaming cards and attachments.",
+  "description": "把 DSH（DeepSeek Harness）接到飞书：在飞书里直接和本机 Agent 对话，流式卡片回答、思考过程、交互问答卡、附件双向收发。Feishu/Lark (飞书) channel for DeepSeek Harness — one chat bound to one DSH session, streaming cards and attachments.",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -14,12 +14,19 @@
   },
   "keywords": [
     "dsh",
+    "deepseek",
     "deepseek-harness",
     "feishu",
     "lark",
+    "飞书",
     "channel",
     "im",
-    "plugin"
+    "chatbot",
+    "bot",
+    "bridge",
+    "messaging",
+    "plugin",
+    "dsh-plugin"
   ],
   "exports": {
     ".": "./index.js",
