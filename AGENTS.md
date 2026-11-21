@@ -117,7 +117,7 @@ Add to the profile's `cordis.patch.yml` (or the plugin's settings form):
     sessionId: session-<a fresh uuid>   # created on the first inbound message
     allowedUsers: ["ou_…"]              # the human's open_id; empty = first sender binds
     workspacePath: ""                   # empty → a non-system-drive default
-    permissionPreset: workspace-write     # session policy inside that workspace
+    permissionPreset: workspace-write     # 显式固定；不写则不改会话原有策略
 ```
 
 Ask the user for their **open_id** first (`feishu_channel_status` does not expose it; the
@@ -134,7 +134,7 @@ The three defaults are security-relevant, so state them when you enable inbound:
 |---|---|
 | `inboundEnabled: false` | nothing listens until the user opts in |
 | `allowedUsers: []` | first sender (Feishu) / logged-in account (WeChat) becomes owner. Not "open to everyone", but not a safe default either: whoever speaks first in a chat that was forwarded or added to a group becomes the owner. Prefer listing the open_id. |
-| `permissionPreset: workspace-write` + `applyPermissionPreset: true` | writes stay inside the workspace. The preset also carries `approval: ask`; the plugin now answers that in the chat (see below), so an out-of-workspace action asks instead of silently escalating. `danger-full-access` removes both the confinement and the prompt; a deployment that needs unattended out-of-workspace writes sets it explicitly. |
+| `permissionPreset: workspace-write` + `applyPermissionPreset: true` | writes stay inside the workspace. The preset also carries `approval: ask`; the plugin now answers that in the chat (see below), so an out-of-workspace action asks instead of silently escalating. `danger-full-access` removes both the confinement and the prompt; a deployment that needs unattended out-of-workspace writes sets it explicitly. **Empty (the default) means "do not touch":** the session keeps whatever policy it already has, so an upgrade never changes existing behaviour. A schema default here once silently downgraded every profile that never set it (issue #4, fixed in 0.9.37). |
 | `approvalPrompts: true` + `approvalTimeoutSeconds: 300` | an approval that needs permission is asked in the chat — **as an interactive card on Feishu** (buttons `允许这一次` / `拒绝`, patched in place once settled) and as a numbered text prompt on WeChat. Text replies still work on both. No reply past the timeout counts as refused — silence is never consent. Anything other than a clear yes/no is left to the agent as an ordinary message. |
 
 ## 5. What the user will see
