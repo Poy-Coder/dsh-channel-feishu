@@ -575,6 +575,26 @@ await handleInboundEvent(
 )
 assert.deepEqual(presetCalls, [], 'a session already on the preset must not be switched again')
 
+// 11b. Not configured means "leave the session alone". A schema default here is a
+// policy change nobody signed up for: 0.9.35 made it workspace-write and silently
+// downgraded every existing profile (issue #4).
+presetCalls.length = 0
+await handleInboundEvent(
+  makePresetCtx('danger-full-access'),
+  { sessionId: 'session-target', logFile, permissionPreset: '' },
+  feishuEvent('perm-unset'),
+  new Set(),
+)
+assert.deepEqual(presetCalls, [], 'an unset preset must not touch the session policy')
+presetCalls.length = 0
+await handleInboundEvent(
+  makePresetCtx('danger-full-access'),
+  { sessionId: 'session-target', logFile },
+  feishuEvent('perm-missing'),
+  new Set(),
+)
+assert.deepEqual(presetCalls, [], 'an absent preset must not touch the session policy')
+
 // 12. Every session in the Feishu workspace inherits the channel policy, including
 // one opened from the GUI (its cwd is the workspace directory); sessions elsewhere
 // keep their own policy.
@@ -743,7 +763,7 @@ const statusReport = await statusText(
 )
 assert.match(statusReport, /会话：session-x/)
 assert.match(statusReport, /工作区：C:\\tmp\\feishu-ws/)
-assert.match(statusReport, /权限：workspace-write/)
+assert.match(statusReport, /权限：(workspace-write（来源：配置）|\(未配置)/)
 assert.match(statusReport, /目标群：oc_x/)
 
 // 17. Thinking process + reaction acknowledgement: CoT events are well-formed and

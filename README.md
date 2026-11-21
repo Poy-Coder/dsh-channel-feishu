@@ -58,7 +58,7 @@ dsh plugin add dsh-channel-feishu
 
 ```bash
 dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu
-dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.36/dsh-channel-feishu-0.9.36.tgz
+dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.37/dsh-channel-feishu-0.9.37.tgz
 ```
 
 依赖必须用扁平结构装（非 ASCII 目录下 pnpm 的软链会把路径写坏）：`pnpm install --node-linker=hoisted`。
@@ -255,13 +255,15 @@ node <profile>/node_modules/dsh-channel-feishu/scripts/setup.mjs
     problemNotices: true        # 出错/崩溃时往飞书推原因；关掉只剩日志
     textProgressSeconds: 30     # 纯文本通道（微信）的进度间隔；0 = 不发进度
     mirrorUserMessages: true    # 桌面端消息转发到飞书
-    permissionPreset: workspace-write    # 默认只写工作区；要全自动无人值守再改 danger-full-access
+    permissionPreset: workspace-write    # 显式固定；不写则不改变会话原有策略
     applyPermissionPreset: true
     region: feishu
     logLevel: info              # debug | info | warn | error
 ```
 
-`permissionPreset` 默认 **`workspace-write`**：通道回合无人值守，这个预设把写入限制在工作区内（读不受限），越界操作会请求批准——而 IM 里没有人能点那个批准，所以回合会停在那里而不是悄悄提权。确实需要「越界也能自动写」时，显式改成 `danger-full-access`（沙箱全开 + 永不询问），这个选择不会被默认接管。
+`permissionPreset` **默认不配置**：插件不动会话原有的权限策略，你在 GUI 里选的什么就是什么。**要固定就显式写**——通道回合无人值守，推荐显式设为 `workspace-write`（写限定在工作区内，越界操作走审批卡）或 `danger-full-access`（全自动）。`/status` 里会标出当前值来自「配置」还是「未配置」。
+
+> **升级注意（0.9.35 的教训）**：0.9.35 曾把默认值写成 `workspace-write`，导致**没有显式配置过的老 profile 静默降级**（见 [issue #4](https://github.com/Poy-Coder/dsh-channel-feishu/issues/4)）。0.9.37 起默认值改回「不配置」，升级不再改变已有 profile 的行为。如果你的 profile 里没有 `permissionPreset` 而希望保持全自动，请显式写 `permissionPreset: danger-full-access`。
 
 ### 3. 飞书侧
 
