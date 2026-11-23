@@ -1,6 +1,6 @@
 {
   "name": "dsh-channel-feishu",
-  "version": "0.9.41",
+  "version": "0.9.42",
   "type": "module",
   "description": "把 DSH（DeepSeek Harness）接到飞书：在飞书里直接和本机 Agent 对话，流式卡片回答、思考过程、交互问答卡、附件双向收发。Feishu/Lark (飞书) channel for DeepSeek Harness — one chat bound to one DSH session, streaming cards and attachments.",
   "license": "MIT",

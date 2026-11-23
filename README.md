@@ -60,7 +60,7 @@ dsh plugin add dsh-channel-feishu
 
 ```bash
 dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu
-dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.41/dsh-channel-feishu-0.9.41.tgz
+dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.42/dsh-channel-feishu-0.9.42.tgz
 ```
 
 依赖必须用扁平结构装（非 ASCII 目录下 pnpm 的软链会把路径写坏）：`pnpm install --node-linker=hoisted`。
@@ -302,7 +302,7 @@ allowedUsers:
 | 命令 | 作用 |
 |---|---|
 | `/help` | 命令列表 |
-| `/status` | 当前会话、工作区、权限、入站状态；有更新版本时会多一行提示 |
+| `/status` | 当前会话、工作区、权限、入站状态；另有版本提示和「补拉：今日 N 次 · 当前间隔 M 分钟」（飞书 API 配额就靠这行自查）|
 | `/why` | 这一轮在做什么、是否正常（一句话）。卡片不显示这个提示，命令随时可以发 |
 | `/new [内容]` | 开新会话（带内容则作为第一条消息） |
 | `/rename <标题>` | 改名 |
@@ -409,7 +409,8 @@ allowedUsers:
 | 装完能收到「通道已就绪」，发消息没反应 | 看日志有没有 `inbound`；老版本在无会话时会直接丢弃 |
 | `card-update-failed` / `300309 streaming mode is closed` | 卡片不是流式模式，更新写不进去；0.9.0 起问答卡已开启流式 |
 | 一条回答出现两张卡片（一张停在「回复中」并写着「本轮回答见下方 ↓」，一张是正文） | 流式写入与收尾抢同一个 `sequence`（飞书 `300317`），收尾失败后会补发一张。现在同一张卡的写入按 `sequence` 串行，冲突自动重试一次，日志里应只剩 `card closed` |
-| 长连接显示「已恢复」，但发消息没反应（出站正常） | SDK 重连可能拿回一条“心跳通、事件不通”的 socket。现在重连后 3 分钟没有入站就重建客户端（日志 `rebuild`），在线期间每 2 分钟补拉一次历史（`reconcile`），漏掉的消息会在 2 分钟内补回 |
+| 长连接显示「已恢复」，但发消息没反应（出站正常） | SDK 重连可能拿回一条“心跳通、事件不通”的 socket。现在重连后 3 分钟没有入站就重建客户端（日志 `rebuild`），在线期间**按活跃度补拉**历史（`reconcile`）：10 分钟内有对话时每 2 分钟，一小时内每 10 分钟，更久没动静每 30 分钟；漏掉的消息在活跃期 2 分钟内补回 |
+| 收到 `99991403` | 飞书 API 月度额度用尽。免费版/标准版 **10,000 次/月**，且是租户下所有自建应用共享。0.9.42 起补拉已按活跃度自动降频（空闲 30 分钟一次，约 160 次/天）；仍然超就升级飞书版本。`feishu_channel_status` 里「补拉：今日 N 次」可看消耗速度 |
 | 插件加载失败、工具全消失 | 检查 `package.json` 是否被写成带 BOM 的 UTF-8 |
 | 发文件报权限错误 | 应用要开 `im:resource` 上传权限 |
 | 同一 App 两条长连接 | 只能有一个通道插件用这个 App，旧通道要先 `disabled: true` |

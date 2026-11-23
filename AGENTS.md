@@ -231,6 +231,17 @@ Tell them, in this order:
   and `listRecentMessages` cold-reads the cursor that predates the reconcile window. That
   closes the gap the Feishu catch-up covers through the messages API. The cold read never
   writes the live cursor back, and it is throttled to one call per five minutes.
+- **The catch-up poll follows activity, not a fixed clock.** One `reconcile` run costs
+  one base-API call; a free/standard Feishu tenant allows 10,000 a month shared across
+  all self-built apps, so a flat 2-minute poll (21,600/month) empties the quota in about
+  fourteen days and then *every* call fails with `99991403` (issue #6). `nextReconcileDelay`
+  returns 2 min while the chat is active (inbound within 10 min), 10 min while warm
+  (within an hour), and 30 min cold. The look-back window is independent: only the
+  interval spends quota. **WeChat keeps the flat 2-minute loop**: its cold read is already
+  rate-limited inside the provider (`COLD_READ_MIN_GAP_MS`), and slowing its catch-up
+  would delay recovery without saving a documented budget.
+  `feishu_channel_status` reports today's count and the current interval, so a user can
+  see the burn rate before the quota runs out;
 - **CoT events are byte-bounded.** The platform counts UTF-8 bytes; a long Chinese
   reasoning block must be chunked (the plugin does this). `10001 event[N] content too
   long` means the payload exceeded the budget.
