@@ -262,6 +262,13 @@ Tell them, in this order:
 - **CoT events are byte-bounded.** The platform counts UTF-8 bytes; a long Chinese
   reasoning block must be chunked (the plugin does this). `10001 event[N] content too
   long` means the payload exceeded the budget.
+- **A streaming card dies after ~10–20 minutes, so long turns must rebuild it.** The
+  platform closes the streaming entity and then answers `200850 card streaming timeout`
+  or `300309 streaming mode is closed` to further writes. Both codes are the same event
+  and both must reach the recovery branch (`isStreamingClosed`), which drops the card,
+  clears `cardFailed` (otherwise `ensureCard` refuses to build a replacement) and starts
+  a fresh one — six times, about two hours. Classifying only `300309` was the bug behind
+  a frozen card on a 19-minute turn (2026-11-24);
 - **A plain-text channel (WeChat) gets progress on a cadence, not a stream.** With no
   editable message there is no card to update, so `providers/text-stream.js` pushes one
   bubble after `textProgressSeconds` (30 s), then one per gap (180 s), at most three per
