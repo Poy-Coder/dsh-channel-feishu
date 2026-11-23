@@ -51,19 +51,42 @@ check `feishu_channel_status` — its `pluginVersion` must name the version you 
 
 ## 2. Create the Feishu app — the type matters
 
-**Fastest path: `node scripts/feishu-login.mjs`.** It runs the platform's RFC 8628 device
-registration (`POST https://accounts.feishu.cn/oauth/v1/app/registration`,
-`action=begin|poll`), prints a link plus a pairing code, and on confirmation creates a
-**PersonalAgent** app with every scope and event this channel uses already attached
-(`REQUIRED_SCOPES` / `REQUIRED_EVENTS` in that script), then writes
-`~/.dsh/feishu-channel.json` (0600). `--fix` re-runs the same flow against the configured
-app to add scopes a new version needs. Two constraints worth knowing: `auth_method:
-client_secret` is mandatory in the `begin` body (its absence answers `invalid_request`),
-and a *pending* poll answers HTTP 400 with `error=authorization_pending` — that is the
-normal wait state, not a failure.
+**Your job is to finish the setup for the user, not to hand them a list of steps.** The
+scan flow is built for that: it deliberately splits into a call that *starts* a run and a
+call that *checks* it, because you must not hold a turn open while someone finds their
+phone.
 
-Use the console path below when the tenant needs an admin-controlled enterprise app
-instead of a personal one.
+### The agent flow (do this, in order)
+
+1. `node scripts/feishu-login.mjs --begin` — prints JSON with `url`, `qrImage`,
+   `userCode`, `expiresInMinutes`. It does **not** wait.
+2. **Send the code to the user yourself.** In an IM session you have a file tool
+   (`feishu_send_file` / `wechat_send_file`) — send `qrImage` (the PNG path). In the Web
+   GUI, show `url` and tell them the pairing code. **A terminal QR is useless to someone
+   talking to you in a chat — that is the whole point of the split.**
+3. Tell them plainly: open the link (or scan the image) on their phone, confirm in Feishu,
+   then say when done. Say the code expires in `expiresInMinutes`.
+4. `node scripts/feishu-login.mjs --poll` — exit 0 = created and credentials saved,
+   exit 2 = **still waiting, not an error** (ask again), exit 1 = failed or expired.
+   Use `--poll --wait` only if you can afford to block for a few minutes.
+5. After success, continue the install yourself: set `inboundEnabled: true` in the profile
+   row, restart, send a test message, then run the §6 verification checklist.
+
+`--fix` runs the same flow against the configured app to add scopes a new version needs —
+offer it when the log shows a permission error, and again send the image to the user.
+
+Two protocol constraints worth knowing when debugging: `auth_method: client_secret` is
+mandatory in the `begin` body (its absence answers `invalid_request`), and a *pending*
+poll answers HTTP 400 with `error=authorization_pending` — that is the normal wait state,
+not a failure.
+
+The created app is a **PersonalAgent** with `REQUIRED_SCOPES` / `REQUIRED_EVENTS` from
+that script attached at creation time, and credentials land in
+`~/.dsh/feishu-channel.json` (0600).
+
+Use the console path below only when the tenant needs an admin-controlled enterprise app
+instead of a personal one — and even then, walk the user through it step by step rather
+than pasting the list.
 
 Tell the user to open <https://open.feishu.cn/app> and use **创建企业自建应用**
 ("custom app", inside their own tenant).
@@ -200,10 +223,17 @@ Tell them, in this order:
 
 - the app id you configured (never the secret), the workspace path, and whether inbound
   is on;
+- **whether you created the app by scanning or they created it in the console** — this
+  decides what they still have to do;
 - which checks in §6 passed;
 - what they must still do (e.g. publish the app version, add a scope, set the allowlist);
 - how to stop it: set `enabled: false` (tools off) or `inboundEnabled: false` (no
   connection), or disable the bundle.
+
+If you took the scan path, one thing is worth saying explicitly: **the app was created
+with the scopes and events this channel uses**, so there is no permission checklist to
+work through — and if a future version needs a new scope, `--fix` adds it with one more
+scan instead of a manual trip to the console.
 
 ## 8. Stability semantics (so you do not mis-diagnose)
 
@@ -289,3 +319,26 @@ Tell them, in this order:
   auto-named, unattended preset) instead of running a separate headless process.
 - **Native thinking process** (Feishu CoT) plus streaming card, reactions and slash
   commands, in one small dependency-light package.
+
+## 10. Releasing
+
+This package ships often — several times a day while a bug is being chased. That is a
+deliberate trade (fast fixes over long release trains), and it moves the weight onto two
+rules instead of onto a slow cadence:
+
+- **Never publish a tarball whose contents were not checked.** `release.ps1` runs
+  `pack-check.ps1` before `npm publish`: it packs the artifact and fails when
+  `package/index.js`, `package/lib/`, `package/providers/` or `package/README.md` are
+  missing. This exists because `dsh-channel-wechat-ilink@0.1.28` shipped without `lib/`,
+  and every user who installed it got a plugin that could not load.
+- **Start every release note with what it asks of the user**, so the `/status` line
+  "新版本可用" is actionable without opening a changelog:
+
+  | prefix | meaning |
+  |---|---|
+  | `安全：` | update now |
+  | `修复：` | worth updating (a real bug) |
+  | `功能：` | optional, take it if you want the feature |
+  | `文档：` | can be skipped |
+
+The version number alone never says whether an update matters; the prefix does.

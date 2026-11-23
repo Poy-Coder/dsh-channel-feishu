@@ -61,7 +61,7 @@ dsh plugin add dsh-channel-feishu
 
 ```bash
 dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu
-dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.44/dsh-channel-feishu-0.9.44.tgz
+dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.45/dsh-channel-feishu-0.9.45.tgz
 ```
 
 依赖必须用扁平结构装（非 ASCII 目录下 pnpm 的软链会把路径写坏）：`pnpm install --node-linker=hoisted`。
@@ -287,6 +287,13 @@ node scripts/feishu-login.mjs
 - 一次配齐所需权限：`im:message.p2p_msg:readonly`、`im:message:send_as_bot`、`im:resource`、`cardkit:card:write`、`im:message.react`；
 - 订阅两个事件：`im.message.receive_v1`（收消息）、`card.action.trigger`（卡片按钮回调）；
 - 把 appId / appSecret 写进 `~/.dsh/feishu-channel.json`（权限 0600）。
+
+**如果你是在聊天里让 Agent 装的，它会自己带你走完这一步**：Agent 会跑 `--begin` 拿到链接和二维码图片、把图片发给你、等你确认后再 `--poll`，然后接着配 profile 并验证。你不需要去开放平台点任何东西，也不用抄 appId。
+
+```bash
+node scripts/feishu-login.mjs --begin   # 只发起：输出 url / qrImage / 配对码
+node scripts/feishu-login.mjs --poll    # 检查结果：0 成功、2 还在等、1 失败
+```
 
 应用升级后如果提示权限不足，跑 `node scripts/feishu-login.mjs --fix`，扫码一次补齐缺失的权限——不用回后台逐项点。
 
