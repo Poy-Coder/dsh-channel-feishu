@@ -140,12 +140,28 @@ The three defaults are security-relevant, so state them when you enable inbound:
 ## 5. What the user will see
 
 - the agent's answer streams into a reply card (headerless, fill width, footer flips from
-  `流式输出中` to `完成`);
+  `流式输出中` to `完成`) — **unless `answerMode: native`**, in which case the card keeps
+  only the progress line and every step's answer leaves as its own native `post` message:
+  copyable, searchable, forwardable, and a multi-step turn reads as several messages in
+  order. `providers/post.js` converts Markdown to `post` elements, and `finalizeTurn`
+  closes such a card with an empty body so the answer is never replayed into it. A
+  `post` message has **no table element** (only cards do), so a markdown table degrades
+  to `列1 → 列2` lines with a bold header; code blocks, bold, links and `_italic_`
+  survive. `snake_case` identifiers must not become italic — the emphasis pattern is
+  word-boundary anchored for that reason. Closing such a card moves **only the footer**
+  (`note_1` → 完成): writing an empty body is rejected by Feishu with
+  `99992402 field validation failed`, which aborts the close and leaves the card frozen
+  on 回复中 — a real symptom seen on 2026-11-23;
 - a separate **thinking process** message shows reasoning and tool calls (native CoT);
-- their message gets a `THINKING` reaction while the turn runs, removed when it ends;
+- the acknowledgement reaction is **off** in this profile (`reactions: false`): the card
+  already shows the same state, so the emoji was redundant;
 - slash commands: `/help`, `/status`, `/why`, `/new`, `/rename`, `/stop`, `/model`, `/think`.
   `/why` answers with live state in one line (`正在执行 read_file · 42s · 正常`); it is
-  intercepted before the model, so it also works while a turn is running.
+  intercepted before the model, so it also works while a turn is running. `/status`
+  carries the upgrade notice: `lib/update.js` asks the registry for `latest` at most
+  once a day (cached in `<DSH_HOME>/<slug>-update.json`, every failure silent) and the
+  status shows `新版本：X 可用（当前 Y）`. It **never updates itself** — the user
+  upgrades from DSH's Plugins page, because an upgrade can break a session in use;
 
 ## 6. Verification checklist — do all of it
 
