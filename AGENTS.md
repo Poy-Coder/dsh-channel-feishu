@@ -51,6 +51,20 @@ check `feishu_channel_status` — its `pluginVersion` must name the version you 
 
 ## 2. Create the Feishu app — the type matters
 
+**Fastest path: `node scripts/feishu-login.mjs`.** It runs the platform's RFC 8628 device
+registration (`POST https://accounts.feishu.cn/oauth/v1/app/registration`,
+`action=begin|poll`), prints a link plus a pairing code, and on confirmation creates a
+**PersonalAgent** app with every scope and event this channel uses already attached
+(`REQUIRED_SCOPES` / `REQUIRED_EVENTS` in that script), then writes
+`~/.dsh/feishu-channel.json` (0600). `--fix` re-runs the same flow against the configured
+app to add scopes a new version needs. Two constraints worth knowing: `auth_method:
+client_secret` is mandatory in the `begin` body (its absence answers `invalid_request`),
+and a *pending* poll answers HTTP 400 with `error=authorization_pending` — that is the
+normal wait state, not a failure.
+
+Use the console path below when the tenant needs an admin-controlled enterprise app
+instead of a personal one.
+
 Tell the user to open <https://open.feishu.cn/app> and use **创建企业自建应用**
 ("custom app", inside their own tenant).
 
@@ -241,7 +255,10 @@ Tell them, in this order:
   rate-limited inside the provider (`COLD_READ_MIN_GAP_MS`), and slowing its catch-up
   would delay recovery without saving a documented budget.
   `feishu_channel_status` reports today's count and the current interval, so a user can
-  see the burn rate before the quota runs out;
+  see the burn rate before the quota runs out. **`reconcile: false` removes the timer
+  entirely** (`reconcileEnabled`), which is how to test whether the socket alone is
+  enough: with it off, `/status` says 补拉：已关闭 and no history pull is spent — at the
+  cost of no longer noticing a deaf socket;
 - **CoT events are byte-bounded.** The platform counts UTF-8 bytes; a long Chinese
   reasoning block must be chunked (the plugin does this). `10001 event[N] content too
   long` means the payload exceeded the budget.

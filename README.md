@@ -60,7 +60,7 @@ dsh plugin add dsh-channel-feishu
 
 ```bash
 dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu
-dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.42/dsh-channel-feishu-0.9.42.tgz
+dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.43/dsh-channel-feishu-0.9.43.tgz
 ```
 
 依赖必须用扁平结构装（非 ASCII 目录下 pnpm 的软链会把路径写坏）：`pnpm install --node-linker=hoisted`。
@@ -266,15 +266,35 @@ node <profile>/node_modules/dsh-channel-feishu/scripts/setup.mjs
 
 `permissionPreset` **默认不配置**：插件不动会话原有的权限策略，你在 GUI 里选的什么就是什么。**要固定就显式写**——通道回合无人值守，推荐显式设为 `workspace-write`（写限定在工作区内，越界操作走审批卡）或 `danger-full-access`（全自动）。`/status` 里会标出当前值来自「配置」还是「未配置」。
 
+**`reconcile`（补拉开关）**：默认开。它是**唯一按时消耗飞书基础 API 配额的功能**——免费版/标准版 10,000 次/月是租户级共享，所以默认按活跃度降频（活跃 2 分钟、温 10 分钟、冷 30 分钟，约 160 次/天）。设成 `false` 可以完全关掉：不再有任何定时历史拉取，配额消耗归零，代价是**「连接看起来正常但消息不进来」这类故障不再被自动发现**，只能等你发现「发了消息没反应」。关掉后 `/status` 会显示「补拉：已关闭」。
+
 **`reactions`（表情回执）**：默认开，回合进行中在你那条消息上加一个 `THINKING` 表情，回合结束移除。它的唯一作用是**填补卡片出现前的那一两秒**——消息发出到首帧卡片之间没有别的反馈。卡片一旦出现，它和卡片的状态就是重复的，所以**嫌它多余可以关掉**（`reactions: false`），代价是那几秒没有即时确认。
 
 > **升级注意（0.9.35 的教训）**：0.9.35 曾把默认值写成 `workspace-write`，导致**没有显式配置过的老 profile 静默降级**（见 [issue #4](https://github.com/Poy-Coder/dsh-channel-feishu/issues/4)）。0.9.37 起默认值改回「不配置」，升级不再改变已有 profile 的行为。如果你的 profile 里没有 `permissionPreset` 而希望保持全自动，请显式写 `permissionPreset: danger-full-access`。
 
 ### 3. 飞书侧
 
-1. 开放平台建**企业自建应用**，开「机器人」能力，加权限 `im:message`、`im:message:send_as_bot`、
-   `im:resource`（发文件用）、`im:message.react`（表情回执）；
-2. 事件订阅选**长连接**，加 `im.message.receive_v1`；
+**方式一：扫码创建（推荐）**
+
+```bash
+node scripts/feishu-login.mjs
+```
+
+打印一个链接和配对码，用手机飞书扫码（或直接打开链接）确认，插件会自动：
+
+- 在开放平台建好**个人 Agent 类型**的自建应用；
+- 一次配齐所需权限：`im:message.p2p_msg:readonly`、`im:message:send_as_bot`、`im:resource`、`cardkit:card:write`、`im:message.react`；
+- 订阅两个事件：`im.message.receive_v1`（收消息）、`card.action.trigger`（卡片按钮回调）；
+- 把 appId / appSecret 写进 `~/.dsh/feishu-channel.json`（权限 0600）。
+
+应用升级后如果提示权限不足，跑 `node scripts/feishu-login.mjs --fix`，扫码一次补齐缺失的权限——不用回后台逐项点。
+
+> **注意**：扫码创建的是「个人 Agent」类型应用，适合一人一机一号的用法。企业内多人共用的部署仍建议按方式二手动创建，便于管理员管控权限与发布。
+
+**方式二：手动创建**
+
+1. 开放平台建**企业自建应用**，开「机器人」能力，加权限 `im:message.p2p_msg:readonly`、`im:message:send_as_bot`、`im:resource`（发文件用）、`cardkit:card:write`（卡片）、`im:message.react`（表情回执，`reactions: false` 时可不加）；
+2. 事件订阅选**长连接**，加 `im.message.receive_v1` 和 `card.action.trigger`（**少了后者，问答卡和审批卡能显示但点不动**）；
 3. 发布版本并等审核通过。
 
 ## 允许名单
