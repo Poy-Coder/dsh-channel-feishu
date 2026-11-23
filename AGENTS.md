@@ -143,7 +143,9 @@ The three defaults are security-relevant, so state them when you enable inbound:
   `流式输出中` to `完成`);
 - a separate **thinking process** message shows reasoning and tool calls (native CoT);
 - their message gets a `THINKING` reaction while the turn runs, removed when it ends;
-- slash commands: `/help`, `/status`, `/new`, `/rename`, `/stop`, `/model`, `/think`.
+- slash commands: `/help`, `/status`, `/why`, `/new`, `/rename`, `/stop`, `/model`, `/think`.
+  `/why` answers with live state in one line (`正在执行 read_file · 42s · 正常`); it is
+  intercepted before the model, so it also works while a turn is running.
 
 ## 6. Verification checklist — do all of it
 
@@ -213,6 +215,17 @@ Tell them, in this order:
 - **CoT events are byte-bounded.** The platform counts UTF-8 bytes; a long Chinese
   reasoning block must be chunked (the plugin does this). `10001 event[N] content too
   long` means the payload exceeded the budget.
+- **A plain-text channel (WeChat) gets progress on a cadence, not a stream.** With no
+  editable message there is no card to update, so `providers/text-stream.js` pushes one
+  bubble after `textProgressSeconds` (30 s), then one per gap (180 s), at most three per
+  turn. The `/why` hint lives **only** on the first WeChat bubble (`· /why 看状态`): a
+  plain-text chat otherwise never discovers the command, while a Feishu card is already
+  updating and must stay terse — do not put the hint into `progressText`, which both
+  channels share. Two traps live here: a dedupe key that strips the elapsed time makes
+  every later bubble look identical and suppresses the cadence entirely (that was the
+  bug where only the 30 s bubble ever appeared), and the WeChat row loads a **generated
+  copy** (`dsh-channel-wechat`), so editing the source alone leaves WeChat on old code —
+  run `build-wechat.mjs` (or `sync-check.ps1` will report it).
 
 ## 9. How this differs from other Feishu plugins (tell the user if they ask)
 

@@ -59,7 +59,7 @@ dsh plugin add dsh-channel-feishu
 
 ```bash
 dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu
-dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.38/dsh-channel-feishu-0.9.38.tgz
+dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.39/dsh-channel-feishu-0.9.39.tgz
 ```
 
 依赖必须用扁平结构装（非 ASCII 目录下 pnpm 的软链会把路径写坏）：`pnpm install --node-linker=hoisted`。
@@ -299,6 +299,7 @@ allowedUsers:
 |---|---|
 | `/help` | 命令列表 |
 | `/status` | 当前会话、工作区、权限、入站状态 |
+| `/why` | 这一轮在做什么、是否正常（一句话）。卡片不显示这个提示，命令随时可以发 |
 | `/new [内容]` | 开新会话（带内容则作为第一条消息） |
 | `/rename <标题>` | 改名 |
 | `/stop` | 中断进行中的回合 |

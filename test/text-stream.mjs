@@ -49,6 +49,28 @@ clock = 240_000
 const secondProgress = stream.push(progressLine('feishu_send_file', 5, 240))
 assert.equal(secondProgress.length, 1)
 assert.match(secondProgress[0].text, /feishu_send_file/)
+// The first bubble teaches `/why` even on a busy turn that never reaches the
+// "nothing to report" branch; later bubbles stay terse.
+assert.match(firstProgress[0].text, /\/why/, '第一条进度必须让人知道 /why')
+assert.doesNotMatch(secondProgress[0].text, /\/why/, '后面的进度不再重复提示')
+
+// 3b. A turn that keeps running with no new status still gets a cadence: one
+//     bubble per gap, capped at progressMax. Before this, a long thinking turn
+//     produced exactly one bubble at 30 s and then silence, so it looked dead.
+clock = 0
+const cadence = createTextStream({ now: () => clock })
+cadence.begin()
+const sameStatus = (seconds) => `思考中…\n\n<font color="grey">已用时 ${seconds}s · 输入 /why 查看实时状态</font>`
+clock = 30_000
+assert.equal(cadence.push(sameStatus(30)).length, 1, '第一次在 30 秒')
+clock = 60_000
+assert.equal(cadence.push(sameStatus(60)).length, 0, '间隔不足 180 秒时不重复')
+clock = 210_000
+assert.equal(cadence.push(sameStatus(210)).length, 1, '下一个间隔照常提醒')
+clock = 390_000
+assert.equal(cadence.push(sameStatus(390)).length, 1, '第三次提醒')
+clock = 570_000
+assert.equal(cadence.push(sameStatus(570)).length, 0, '到 progressMax 就停')
 
 // 4. The interval is a knob: default 30 s, configurable, 0 turns progress off.
 clock = 0
