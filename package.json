@@ -46,6 +46,7 @@
   },
   "files": [
     "index.js",
+    "lib",
     "providers",
     "cordis.patch.yml",
     "README.md",
