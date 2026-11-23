@@ -39,7 +39,7 @@
 ## 它提供什么
 
 - **双向通道**：飞书私聊 → DSH 会话；一轮结束把答复自动发回原聊天，不需要模型调工具
-- **流式卡片**：思考过程单独一条消息，正文卡片逐字出现，底栏依次是 `等待回答 → 流式输出中 → 完成`
+- **流式卡片**：思考过程单独一条消息，正文卡片逐字出现，底栏依次是 `等待回答 → 流式输出中 → 完成`。卡片用默认宽度（不撑满聊天区），这样四个角都是一致的圆角；撑满模式只有顶部两角是圆的，看起来像被裁掉
 - **卡片只放进度（`answerMode: native`）**：卡片只显示思考状态与工具调用；**每一步的正文单独作为一条原生富文本消息发出**，可复制、可搜索、可转发，多步骤任务会在聊天里按顺序看到每一步。原生消息没有表格元素，markdown 表格会降级成 `之前 → 之后` 的单行（表头加粗），代码块、粗体、链接、斜体照常渲染；卡片收尾只翻底栏为「完成」（飞书拒绝空内容，写空会报 `99992402`）
 - **不会静默**：工具开始/结束时卡片立刻更新，长任务期间每 10 秒刷新一次进度——`正在执行 feishu_send_file · 已调用 3 个工具 · 已用时 42s`，不用猜它是卡住了还是在干活
 - **出错会说话，但不吵**：回合失败、消息没投递到会话、进程半途退出，会往飞书推一条写明原因的通知（`problemNotices: false` 可关）。长连接断开要**持续 90 秒**以上才通知——正常重连只要几秒，那种抖动你根本察觉不到，所以不发；只有断开期间才补发“已恢复”，且连接类通知最多 10 分钟一条。同一段时间里断开 3 次以上，只发一条「连接不稳定」而不是一串卡片
@@ -60,7 +60,7 @@ dsh plugin add dsh-channel-feishu
 
 ```bash
 dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu
-dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.40/dsh-channel-feishu-0.9.40.tgz
+dsh plugin add https://github.com/Poy-Coder/dsh-channel-feishu/releases/download/v0.9.41/dsh-channel-feishu-0.9.41.tgz
 ```
 
 依赖必须用扁平结构装（非 ASCII 目录下 pnpm 的软链会把路径写坏）：`pnpm install --node-linker=hoisted`。
@@ -253,6 +253,7 @@ node <profile>/node_modules/dsh-channel-feishu/scripts/setup.mjs
     workspacePath: ""           # 空 = 按通道默认：飞书 dsh/feishu、微信 dsh/wechat
     allowedUsers: []            # 空 = 第一个发消息的人绑定此通道；微信则是扫码登录的人
     streamingCards: true
+    reactions: true             # 回合进行中给你的消息加一个「思考中」表情，结束后移除
     autoReply: true
     problemNotices: true        # 出错/崩溃时往飞书推原因；关掉只剩日志
     textProgressSeconds: 30     # 纯文本通道（微信）的进度间隔；0 = 不发进度
@@ -264,6 +265,8 @@ node <profile>/node_modules/dsh-channel-feishu/scripts/setup.mjs
 ```
 
 `permissionPreset` **默认不配置**：插件不动会话原有的权限策略，你在 GUI 里选的什么就是什么。**要固定就显式写**——通道回合无人值守，推荐显式设为 `workspace-write`（写限定在工作区内，越界操作走审批卡）或 `danger-full-access`（全自动）。`/status` 里会标出当前值来自「配置」还是「未配置」。
+
+**`reactions`（表情回执）**：默认开，回合进行中在你那条消息上加一个 `THINKING` 表情，回合结束移除。它的唯一作用是**填补卡片出现前的那一两秒**——消息发出到首帧卡片之间没有别的反馈。卡片一旦出现，它和卡片的状态就是重复的，所以**嫌它多余可以关掉**（`reactions: false`），代价是那几秒没有即时确认。
 
 > **升级注意（0.9.35 的教训）**：0.9.35 曾把默认值写成 `workspace-write`，导致**没有显式配置过的老 profile 静默降级**（见 [issue #4](https://github.com/Poy-Coder/dsh-channel-feishu/issues/4)）。0.9.37 起默认值改回「不配置」，升级不再改变已有 profile 的行为。如果你的 profile 里没有 `permissionPreset` 而希望保持全自动，请显式写 `permissionPreset: danger-full-access`。
 

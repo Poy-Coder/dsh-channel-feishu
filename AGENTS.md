@@ -139,7 +139,8 @@ The three defaults are security-relevant, so state them when you enable inbound:
 
 ## 5. What the user will see
 
-- the agent's answer streams into a reply card (headerless, fill width, footer flips from
+- the agent's answer streams into a reply card (headerless, **default width** — `fill`
+  leaves only the top corners rounded, so the shape reads as cut off; footer flips from
   `流式输出中` to `完成`) — **unless `answerMode: native`**, in which case the card keeps
   only the progress line and every step's answer leaves as its own native `post` message:
   copyable, searchable, forwardable, and a multi-step turn reads as several messages in
@@ -153,8 +154,10 @@ The three defaults are security-relevant, so state them when you enable inbound:
   `99992402 field validation failed`, which aborts the close and leaves the card frozen
   on 回复中 — a real symptom seen on 2026-11-23;
 - a separate **thinking process** message shows reasoning and tool calls (native CoT);
-- the acknowledgement reaction is **off** in this profile (`reactions: false`): the card
-  already shows the same state, so the emoji was redundant;
+- the acknowledgement reaction (`reactions`, default **on**) puts a `THINKING` emoji on the
+  user's own message while the turn runs. Its only job is the one or two seconds before
+  the streaming card exists; after that it duplicates the card, so a user who finds it
+  noisy turns it off with `reactions: false` and loses only that brief confirmation;
 - slash commands: `/help`, `/status`, `/why`, `/new`, `/rename`, `/stop`, `/model`, `/think`.
   `/why` answers with live state in one line (`正在执行 read_file · 42s · 正常`); it is
   intercepted before the model, so it also works while a turn is running. `/status`
