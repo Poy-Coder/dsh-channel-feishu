@@ -60,10 +60,15 @@ phone.
 
 1. `node scripts/feishu-login.mjs --begin` — prints JSON with `url`, `qrImage`,
    `userCode`, `expiresInMinutes`. It does **not** wait.
-2. **Send the code to the user yourself.** In an IM session you have a file tool
-   (`feishu_send_file` / `wechat_send_file`) — send `qrImage` (the PNG path). In the Web
-   GUI, show `url` and tell them the pairing code. **A terminal QR is useless to someone
-   talking to you in a chat — that is the whole point of the split.**
+2. **Send the code to the user yourself.** Pick the surface by what actually exists:
+   - **Web GUI (the normal first-install case): the user has no channel yet — that is why
+     they are installing one, so `feishu_send_file` does not exist.** Use `present` with
+     the `qrImage` path so the QR is rendered in the session, and also give `url` and the
+     pairing code as text. `present` displays after the turn ends, which is fine: the user
+     scans, then says so in the next turn.
+   - **An IM session that already works** (re-configuring, or `--fix`): send `qrImage`
+     with `feishu_send_file` / `wechat_send_file`.
+   - Never rely on the terminal QR alone — the user is not looking at your shell.
 3. Tell them plainly: open the link (or scan the image) on their phone, confirm in Feishu,
    then say when done. Say the code expires in `expiresInMinutes`.
 4. `node scripts/feishu-login.mjs --poll` — exit 0 = created and credentials saved,
